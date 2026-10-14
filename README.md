@@ -16,3 +16,4 @@ For this project.
 My MCU_BOX stl and step have some bugs, i will fix it soon, you can also do your own boxes that will be fit in your pc case.
 *This is just a small SCADA system, not an industrial SCADA system.
  Many thanks.
+Future: I want to store datas in 4 weeks and add function to plot charts by minute, hour, day, and week.
