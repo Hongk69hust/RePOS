@@ -4,7 +4,7 @@
   Powered by LibreHardwareMonitor
   This is program for MCU receiving data from librehardwaremonitor, BMP280,
 signal to ON/OFF Relay/Opto by ESPNOW, showing information on LCD, calculating
-real power consumption of PC system and showing them all in dashbroad. Of course
+real power comnsumption of PC system and showing them all in dashbroad. Of course
 it can let your turn ON/OFF your PC by wireless button/web dashbroad and button
 on your case PC if you make two Y connections for Relay/Opto, POWER SW headers
 and Power Button on your case.
@@ -23,8 +23,8 @@ extern "C" {
   #include <espnow.h>
 }
 // WIFI CONFIGURATION, ONLY 2.4GHz Wifi (NOT 5GHz or mixed 2.5GHz/5GHz) or you can use MCU supporting 5GHz, ESP8266 does not support
-const char* WIFI_SSID = "esp8266wifi"; // Please enter wifi name
-const char* WIFI_PASS = "13121974Me"; // Please enter wifi password 
+const char* WIFI_SSID = ""; // Please enter wifi name
+const char* WIFI_PASS = ""; // Please enter wifi password 
 // STATIC IP CONFIGURATION
 IPAddress local_IP(192, 168, 1, 115); // This is fixed address of web dashbroad 
 IPAddress gateway(192, 168, 1, 1); 
