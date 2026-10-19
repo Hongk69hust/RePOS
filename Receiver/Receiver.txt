@@ -1,7 +1,5 @@
 /*
-  RePOS: Remote PC & SCADA REALTIME
-  Real-time PC Hardware Monitoring & Remote Control
-  Powered by LibreHardwareMonitor
+  This program is used for Receiver
   This is program for MCU receiving data from librehardwaremonitor, BMP280,
 signal to ON/OFF Relay/Opto by ESPNOW, showing information on LCD, calculating
 real power comnsumption of PC system and showing them all in dashbroad. Of course
@@ -879,7 +877,7 @@ body .unit {
   <div class="brand">
     <div class="brand-icon">⌘</div>
     <div>
-      <h1>RePOS: Remote PC &amp; SCADA REALTIME</h1>
+      <h1>RePOS: Remote Power Operation &amp; SCADA</h1>
       <div class="sub">
         Real-time PC Hardware Monitoring &amp; Remote Control
         <br>
@@ -1213,7 +1211,7 @@ body .unit {
 </div>
 <!-- Footer -->
 <footer>
-  RePOS: Remote PC &amp; SCADA Realtime
+  RePOS: Remote Power Operation &amp; SCADA
   <br>
   Developed by <strong>Chu Xuân Hồng</strong>
 </footer>
