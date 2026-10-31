@@ -18,8 +18,15 @@ Data Collector is files that will collect data from LibreHardwareMonitor and sen
 .NET 10.4 (HAVE TO DO)
  }
   For this project.
-- **My MCU_BOX stl and step have some bugs, i will fix it soon, you can also do your own boxes that will be fit in your pc case.
+- **My MCU_BOX stl and step have some bugs, i will fix it soon (FIXED), you can also do your own boxes that will be fit in your pc case.
 - **This is just a small SCADA system, not an industrial SCADA system.
  Many thanks.
 - ***Future: I want to store datas in 4 weeks and add function to plot charts by minute, hour, day, and week.
-        Using MQTT instead of HTTP to reduce load for MCU/ network.
+        Using MQTT instead of HTTP to reduce load for MCU/ network. 
+        I will update more...
+- ***UPDATE:
+- *** MQTT is not suitable for this project because MQTT requires "Broker". I will not make a Broker for this project, if you want to do a bigger one, u should have a Broker and use MQTT instead of HTTP. If i use MQTT and let ESP8266 becomes Broker, the web dashbroad will look very bad, and it will essentially just display the digits line by line. As im using HTTP, i optimized the code and existing hardware to create an clearly and highly customizable web dashboard (supporting adjustments for font size, color, and transparency) while maintaining a data transmission 1s/time.
+- *** BIG PROBLEM: If your pc is unpluged or power outage appears, your pc will be in "COLD BOOT" state when you plug it in or when power comes back on, although you turn on "USB STANDBY VOLTAGE" S5, turn off "ErP READY" in mainbroad BIOS. Explanation: When you turn off your pc, it will be from S0 (working) to S5 (Soft-OFF) if you turn S5 on as i said. However, when you unplug or power outage appears, your pc will be from S0 (if pc is on) or S5 (if pc is off) to G3 (Mechanical Off) then when you plug it in or when power comes back on pc will be from G3 to S5 (COLD BOOT).
+- ** This is the problem that you can not fix because it is safety method of new-gen mainbroad (im using B760m), lower one may not have but im not sure so you will need to turn on your pc by yourself after unpluging or power outage.
+- ** You can also use battery or 5V adaper for "Receiver" part but i will not remcommend it because battery may cause dangerous problems when ambient temperature up to 40-55 C degree, using adapter will make your pc looks messier. So im fine to turn on by button (as i said you should make Y wires for this project) in the case after unpluged or power outage appears.
+- *** I have tested for 2 weeks (project running 24/7 in 2 weeks), operating perfectly; there is virtually no latency between Sender and Receiver even when i turn on sender and immediately trigger  signal from button. 
