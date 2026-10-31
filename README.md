@@ -23,6 +23,7 @@ Data Collector is files that will collect data from LibreHardwareMonitor and sen
  Many thanks.
 - ***Future: I want to store datas in 4 weeks and add function to plot charts by minute, hour, day, and week.
         Using MQTT instead of HTTP to reduce load for MCU/ network. 
+        Im making tutorial videos for this project, it will be uploaded soon.
         I will update more...
 - ***UPDATE:
 - *** MQTT is not suitable for this project because MQTT requires "Broker". I will not make a Broker for this project, if you want to do a bigger one, u should have a Broker and use MQTT instead of HTTP. If i use MQTT and let ESP8266 becomes Broker, the web dashbroad will look very bad, and it will essentially just display the digits line by line. As im using HTTP, i optimized the code and existing hardware to create an clearly and highly customizable web dashboard (supporting adjustments for font size, color, and transparency) while maintaining a data transmission 1s/time.
