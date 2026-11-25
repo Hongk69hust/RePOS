@@ -1,13 +1,14 @@
 /*
-  This program is used for Receiver
-  This is program for MCU receiving data from librehardwaremonitor, BMP280,
-signal to ON/OFF Relay/Opto by ESPNOW, showing information on LCD, calculating
-real power comnsumption of PC system and showing them all in dashbroad. Of course
-it can let your turn ON/OFF your PC by wireless button/web dashbroad and button
-on your case PC if you make two Y connections for Relay/Opto, POWER SW headers
-and Power Button on your case.
-  Author: Chu Xuân Hồng
-  Time (dd/mm/yyyy): 08/10/2026 
+  Version 1.0:
+   This program is used for Receiver
+   This is program for MCU receiving data from librehardwaremonitor, BMP280,
+  signal to ON/OFF Relay/Opto by ESPNOW, showing information on LCD, calculating
+  real power consumption of PC system and showing them all in dashboard.
+   Author: Chu Xuân Hồng
+   Time (dd/mm/yyyy): 08/10/2026
+   Version 2.3: Updated web dashboard and added sub screen to show infomation about
+  CPU, GPU, Case temperature and PC power.
+   Time (dd/mm/yyyy): 25/11/2006
 */
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -15,79 +16,85 @@ and Power Button on your case.
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_BMP280.h>
 #include <ArduinoJson.h>
+#include <EEPROM.h>
 #include <math.h>
+#include <ctype.h>
+#include <string.h>
 #include <user_interface.h>
 extern "C" {
   #include <espnow.h>
 }
-// WIFI CONFIGURATION, ONLY 2.4GHz Wifi (NOT 5GHz or mixed 2.5GHz/5GHz) or you can use MCU supporting 5GHz, ESP8266 does not support
+// WIFI CONFIGURATION (ONLY 2.4GHz Wi-Fi)
 const char* WIFI_SSID = ""; // Please enter wifi name
-const char* WIFI_PASS = ""; // Please enter wifi password 
+const char* WIFI_PASS = ""; // Please enter wifi password
 // STATIC IP CONFIGURATION
-IPAddress local_IP(192, 168, 1, 115); // This is fixed address of web dashbroad 
-IPAddress gateway(192, 168, 1, 1); 
+IPAddress local_IP(192, 168, 1, 115);
+IPAddress gateway(192, 168, 1, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDNS(192, 168, 1, 1);
 // HARDWARE CONFIGURATION
 #define SDA_PIN D2
-#define SCL_PIN D1 
-#define OPTO_PIN 14 //D5 pin: GPIO14
-#define ESPNOW_CHANNEL 8 // ESPNOW Channel must be the same with sender esp
-#define PULSE_MS 600 //RELAY closes in 0.6s 
+#define SCL_PIN D1
+#define OPTO_PIN 14            // D5 pin: GPIO14
+#define ESPNOW_CHANNEL 8       // Must match sender ESP-NOW channel
+#define PULSE_MS 600           // Relay/Opto pulse duration (ms)
 #define MAX_PENDING_COMMANDS 10
+// EEPROM PERSISTENT STORAGE
+#define EEPROM_SIZE 256
+#define SETTINGS_MAGIC 0x52455033UL // "REP3"
+struct PersistentSettings {
+  uint32_t magic;
+  uint8_t lcdEnabled;
+  uint8_t transparency;
+  uint8_t fontSize;
+  uint8_t filterMask;          // bit0:Power, bit1:Voltage, bit2:Temp, bit3:Fan, bit4:Env
+  char themeMode[12];
+  char bg[8];
+  char panel[8];
+  char text[8];
+  char muted[8];
+  char accent[8];
+};
+PersistentSettings appSettings;
 ESP8266WebServer server(80);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 Adafruit_BMP280 bmp;
 bool bmpAvailable = false;
+char macStr[18] = "00:00:00:00:00:00";
 // ESP-NOW RECEIVER STATE
 volatile uint8_t pendingCommands = 0;
 bool pulseActive = false;
 unsigned long pulseStart = 0;
 bool espNowAvailable = false;
-// SENSOR (BMP280) STATE 
+// SENSOR (BMP280) & TELEMETRY STATE
 float ambientTemp = NAN;
 float pressureHpa = NAN;
 String latestJson = "{\"sensors\":[]}";
 unsigned long lastPcData = 0;
 unsigned long lastBmpRead = 0;
 unsigned long lastLcdPage = 0;
-int lcdPage = 0;
-bool lcdEnabled = true; //LCD control
-// CPU/GPU temperature thresholds in degrees Celsius.
-const float TEMP_YELLOW = 75.0;
-const float TEMP_RED = 95.0;
-// Ambient temperature thresholds.
-const float AMBIENT_YELLOW = 45.0;
-const float AMBIENT_RED = 55.0;
-// Combined CPU and GPU power thresholds in watts.
-const float TOTAL_POWER_YELLOW = 600.0;
-const float TOTAL_POWER_RED = 800.0;
-// Estimated DC power thresholds.
-const float DC_POWER_YELLOW = 800.0;
-const float DC_POWER_RED = 900.0;
-// Fan speed thresholds in RPM.
-const float FAN_YELLOW = 2000.0;
-const float FAN_RED = 2700.0;
-// Voltage thresholds.
-const float V12_YELLOW = 12.60;
-const float V12_RED = 12.90;
-const float V5_YELLOW = 5.25;
-const float V5_RED = 5.50;
-const float V33_YELLOW = 3.465;
-const float V33_RED = 3.60;
-// PC data timeout.
-const unsigned long PC_TIMEOUT = 5000;
-// PSU CONFIGURATION, My PSU: VSP TEREX VXP1000TGD V2. I will take RAM, fan, cooler, SSD, HDD at highest power consumption values.
-const float PSU_RATED_WATTS = 1000.0; // Assume rated PSU power.
-const float CASE_FANS_WATTS = 40.0; // Assume case fans power consumption (My PC has 10 fans so let it is 4W/fan with ARGB and 80% speed for sure).
-const float RAM_WATTS = 10.0; // Assume RAM consumption (16x2 DDR4 is 2x5=10W).
-const float COOLER_WATTS = 6.0; // Thermalright PS120SE.
-const float HDD_WATTS = 9.0; // HDD 3.5".
+uint8_t lcdPage = 0;
+bool lcdEnabled = true;
+// Cached power values for zero-allocation LCD updates
+float cpuPowerWatts = NAN;
+float gpuPowerWatts = NAN;
+float totalPowerWatts = NAN;
+float dcOutputWatts = NAN;
+float realPowerWatts = NAN;
+float psuEfficiency = NAN;
+// PSU CONFIGURATION (VSP TEREX VXP1000TGD V2)
+const float PSU_RATED_WATTS = 1000.0;
+const float CASE_FANS_WATTS = 40.0;
+const float RAM_WATTS = 10.0;
+const float COOLER_WATTS = 6.0;
+const float HDD_WATTS = 9.0;
 const float SATA_SSD_WATTS = 4.5;
-const float NVME_WATTS = 6.0; // NMVE Gen 4
-const float OTHER_WATTS = 50.0; // Mainbroad
-const float OTHER_DC_WATTS = CASE_FANS_WATTS + RAM_WATTS + COOLER_WATTS + HDD_WATTS + SATA_SSD_WATTS + NVME_WATTS + OTHER_WATTS;
-// PSU EFFICIENCY TABLE. You can use graph to calculate, find your PSU efficiency at various load levels.
+const float NVME_WATTS = 6.0;
+const float OTHER_WATTS = 50.0;
+const float OTHER_DC_WATTS =
+    CASE_FANS_WATTS + RAM_WATTS + COOLER_WATTS +
+    HDD_WATTS + SATA_SSD_WATTS + NVME_WATTS + OTHER_WATTS;
+// PSU EFFICIENCY TABLE
 const float PSU_LOAD_POINTS[] = {
   5, 10, 20, 30, 40, 50,
   60, 70, 80, 90, 100, 110
@@ -98,37 +105,89 @@ const float PSU_EFF_POINTS[] = {
   91.79, 91.49, 91.17, 90.82
 };
 const int PSU_POINTS_COUNT =
-    sizeof(PSU_LOAD_POINTS) /
-    sizeof(PSU_LOAD_POINTS[0]);
-float dcOutputWatts = NAN;
-float realPowerWatts = NAN;
-float psuEfficiency = NAN;
-// LCD HELPER
-void lcdLine(byte row, String text) {
-  if (text.length() > 16) {
-    text = text.substring(0, 16);
+    sizeof(PSU_LOAD_POINTS) / sizeof(PSU_LOAD_POINTS[0]);
+// ZERO-ALLOCATION STRING HELPER
+bool strContainsCI(const char* haystack, const char* needle) {
+  if (!haystack || !needle || !*needle) return false;
+  for (const char* h = haystack; *h; h++) {
+    const char* a = h;
+    const char* b = needle;
+    while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
+      a++;
+      b++;
+    }
+    if (!*b) return true;
   }
-  while (text.length() < 16) {
-    text += ' ';
-  }
-  lcd.setCursor(0, row);
-  lcd.print(text);
+  return false;
 }
-// ARLERT: -1 = No data 0 = Normal 1 = Warning 2 = Critical
-int getAlertLevel(float value, float yellow, float red) {
-  if (!isfinite(value)) return -1;
-  if (value >= red) return 2;
-  if (value >= yellow) return 1;
-  return 0;
+// SETTINGS PERSISTENCE HELPERS
+bool isValidHexColor(const char* s) {
+  if (!s || strlen(s) != 7 || s[0] != '#') return false;
+  for (int i = 1; i < 7; i++) {
+    if (!isxdigit((unsigned char)s[i])) return false;
+  }
+  return true;
+}
+void setDefaultSettings() {
+  appSettings.magic = SETTINGS_MAGIC;
+  appSettings.lcdEnabled = 1;
+  appSettings.transparency = 0;
+  appSettings.fontSize = 14;
+  appSettings.filterMask = 0x1F;
+  strlcpy(appSettings.themeMode, "dark", sizeof(appSettings.themeMode));
+  strlcpy(appSettings.bg, "#0b1120", sizeof(appSettings.bg));
+  strlcpy(appSettings.panel, "#151f30", sizeof(appSettings.panel));
+  strlcpy(appSettings.text, "#e8eef8", sizeof(appSettings.text));
+  strlcpy(appSettings.muted, "#93a4bb", sizeof(appSettings.muted));
+  strlcpy(appSettings.accent, "#60a5fa", sizeof(appSettings.accent));
+}
+void saveSettings() {
+  appSettings.magic = SETTINGS_MAGIC;
+  appSettings.lcdEnabled = lcdEnabled ? 1 : 0;
+  PersistentSettings stored;
+  EEPROM.get(0, stored);
+  if (memcmp(&stored, &appSettings, sizeof(PersistentSettings)) != 0) {
+    EEPROM.put(0, appSettings);
+    EEPROM.commit();
+  }
+}
+void loadSettings() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(0, appSettings);
+  bool validFont = (appSettings.fontSize == 12 || appSettings.fontSize == 14 ||
+                    appSettings.fontSize == 16 || appSettings.fontSize == 18);
+  if (appSettings.magic != SETTINGS_MAGIC ||
+      appSettings.transparency > 100 ||
+      !validFont ||
+      !isValidHexColor(appSettings.bg) ||
+      !isValidHexColor(appSettings.panel) ||
+      !isValidHexColor(appSettings.text) ||
+      !isValidHexColor(appSettings.muted) ||
+      !isValidHexColor(appSettings.accent)) {
+    setDefaultSettings();
+    EEPROM.put(0, appSettings);
+    EEPROM.commit();
+    Serial.println(F("EEPROM initialized with default settings"));
+  } else {
+    Serial.println(F("Settings loaded from EEPROM"));
+  }
+  lcdEnabled = (appSettings.lcdEnabled != 0);
+}
+// LCD HELPER
+void lcdLine(byte row, const String &text) {
+  char buf[17];
+  size_t len = text.length();
+  for (size_t i = 0; i < 16; i++) {
+    buf[i] = (i < len) ? text[i] : ' ';
+  }
+  buf[16] = '\0';
+  lcd.setCursor(0, row);
+  lcd.print(buf);
 }
 // PSU EFFICIENCY CALCULATION
 float getPsuEfficiency(float loadPercent) {
-  if (!isfinite(loadPercent) || PSU_RATED_WATTS <= 0) {
-    return NAN;
-  }
-  if (loadPercent <= PSU_LOAD_POINTS[0]) {
-    return PSU_EFF_POINTS[0];
-  }
+  if (!isfinite(loadPercent) || PSU_RATED_WATTS <= 0) return NAN;
+  if (loadPercent <= PSU_LOAD_POINTS[0]) return PSU_EFF_POINTS[0];
   if (loadPercent >= PSU_LOAD_POINTS[PSU_POINTS_COUNT - 1]) {
     return PSU_EFF_POINTS[PSU_POINTS_COUNT - 1];
   }
@@ -138,30 +197,31 @@ float getPsuEfficiency(float loadPercent) {
     if (loadPercent >= x0 && loadPercent <= x1) {
       float y0 = PSU_EFF_POINTS[i];
       float y1 = PSU_EFF_POINTS[i + 1];
-      float ratio = (loadPercent - x0) / (x1 - x0);
-      return y0 + ratio * (y1 - y0);
+      return y0 + ((loadPercent - x0) / (x1 - x0)) * (y1 - y0);
     }
   }
   return NAN;
 }
 // REAL POWER ESTIMATION
 void calculateRealPower(JsonDocument &doc) {
-  float cpu = doc["cpuPowerWatts"] | NAN;
-  float gpu = doc["gpuPowerWatts"] | NAN;
-  if (!isfinite(cpu) || !isfinite(gpu) ||
-      cpu < 0 || gpu < 0) {
+  cpuPowerWatts = doc["cpuPowerWatts"] | NAN;
+  gpuPowerWatts = doc["gpuPowerWatts"] | NAN;
+  if (!isfinite(cpuPowerWatts) || !isfinite(gpuPowerWatts) ||
+      cpuPowerWatts < 0 || gpuPowerWatts < 0) {
+    totalPowerWatts = NAN;
     dcOutputWatts = NAN;
     realPowerWatts = NAN;
     psuEfficiency = NAN;
+    doc["totalPowerWatts"] = nullptr;
     doc["dcOutputWatts"] = nullptr;
     doc["realPowerWatts"] = nullptr;
     doc["psuEfficiencyPercent"] = nullptr;
     return;
   }
-// Estimate total DC output power.
-  dcOutputWatts = cpu + gpu + OTHER_DC_WATTS;
-  float loadPercent =
-      dcOutputWatts / PSU_RATED_WATTS * 100.0;
+  totalPowerWatts = cpuPowerWatts + gpuPowerWatts;
+  doc["totalPowerWatts"] = totalPowerWatts;
+  dcOutputWatts = totalPowerWatts + OTHER_DC_WATTS;
+  float loadPercent = (dcOutputWatts / PSU_RATED_WATTS) * 100.0;
   psuEfficiency = getPsuEfficiency(loadPercent);
   if (!isfinite(psuEfficiency) || psuEfficiency <= 0) {
     realPowerWatts = NAN;
@@ -170,100 +230,10 @@ void calculateRealPower(JsonDocument &doc) {
     doc["psuEfficiencyPercent"] = nullptr;
     return;
   }
-// Estimate AC input power.
-  realPowerWatts =
-      dcOutputWatts / (psuEfficiency / 100.0);
+  realPowerWatts = dcOutputWatts / (psuEfficiency / 100.0);
   doc["dcOutputWatts"] = dcOutputWatts;
   doc["realPowerWatts"] = realPowerWatts;
   doc["psuEfficiencyPercent"] = psuEfficiency;
-}
-// SENSOR HELPERS
-float getSensorValue(JsonObject s) {
-  if (s["value"].is<float>() ||
-      s["value"].is<int>() ||
-      s["value"].is<double>()) {
-    return s["value"].as<float>();
-  }
-  return NAN;
-}
-String getSensorText(JsonObject s, const char* key) {
-  const char* value = s[key] | "";
-  return String(value);
-}
-// SENSOR ALERT CLASSIFICATION
-int getSensorAlertLevel(
-    String type,
-    String name,
-    float value
-) {
-  if (!isfinite(value)) return -1;
-  type.toLowerCase();
-  name.toLowerCase();
-  if (type == "temperature") {
-    return getAlertLevel(value, TEMP_YELLOW, TEMP_RED);
-  }
-  if (type == "fan") {
-    return getAlertLevel(value, FAN_YELLOW, FAN_RED);
-  }
-  if (type == "voltage") {
-    if (name.indexOf("12v") >= 0 ||
-        name.indexOf("12 v") >= 0) {
-      return getAlertLevel(value, V12_YELLOW, V12_RED);
-    }
-    if (name.indexOf("5v") >= 0 ||
-        name.indexOf("5 v") >= 0) {
-      return getAlertLevel(value, V5_YELLOW, V5_RED);
-    }
-    if (name.indexOf("3.3v") >= 0 ||
-        name.indexOf("3v") >= 0 ||
-        name.indexOf("3.3 v") >= 0) {
-      return getAlertLevel(value, V33_YELLOW, V33_RED);
-    }
-    return -1;
-  }
-  return -1;
-}
-// SENSOR NAME NORMALIZATION
-String normalizeSensorName(String device, String name) {
-  String d = device;
-  d.toLowerCase();
-  if (d.indexOf("nuvoton") >= 0 ||
-      d.indexOf("nct6798d") >= 0) {
-    if (name == "Fan #2") return "CPU Fan";
-    if (name == "Fan #3") return "Case Fan";
-  }
-  return name;
-}
-// DASHBOARD ALERT SUMMARY
-int getHighestSensorAlert(JsonArray sensors) {
-  int highest = 0;
-  for (JsonObject s : sensors) {
-    String type = getSensorText(s, "type");
-    String name = getSensorText(s, "name");
-    float value = getSensorValue(s);
-    int level = getSensorAlertLevel(type, name, value);
-    if (level > highest) {
-      highest = level;
-    }
-  }
-  return highest;
-}
-// ALERT TEXT
-const char* getAlertName(int level) {
-  switch (level) {
-    case 0: return "NORMAL";
-    case 1: return "WARNING";
-    case 2: return "DANGER";
-    default: return "NONE";
-  }
-}
-const char* getAlertColor(int level) {
-  switch (level) {
-    case 0: return "green";
-    case 1: return "yellow";
-    case 2: return "red";
-    default: return "gray";
-  }
 }
 // WEB DASHBOARD
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -273,297 +243,464 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0b1120">
-<!-- Favicon: green Command symbol -->
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<title>RePOS</title>
+<title>RePOS — PC Monitor &amp; SCADA</title>
 <style>
 :root {
   --dashboard-font-size: 14px;
   color-scheme: dark;
-  /* Main colors */
   --bg: #0b1120;
   --bg-glow: #152137;
   --panel: #151f30;
+  --panel-glass: rgba(21, 31, 48, 1);
   --panel-hover: #1b2940;
   --border: #29374c;
-  /* Text colors */
   --text: #e8eef8;
   --muted: #93a4bb;
   --text-secondary: #b9c8dc;
-  /* Interactive elements */
   --accent: #60a5fa;
-  --accent-hover: #2563eb;
-  --button-bg: #111a29;
-  --button-hover: #202d40;
-  --button-active-bg: #245a43;
-  --button-active-border: #327654;
-  /* Table colors */
-  --table-header: #202b3d;
+  --button-bg: rgba(17, 26, 41, 0.72);
+  --button-hover: rgba(32, 45, 64, 0.9);
+  --button-active-bg: rgba(16, 48, 35, 0.9);
+  --button-active-border: #28664b;
+  --table-header: #1a2639;
   --table-border: #293548;
-  /* Status colors: keep fixed */
   --green: #4ade80;
   --yellow: #facc15;
   --red: #fb7185;
   --gray: #94a3b8;
-  /* Sensor status backgrounds */
-  --status-green-bg: #10291e;
+  --status-green-bg: rgba(16, 41, 30, 1);
   --status-green-border: #216b48;
-  --status-yellow-bg: #30270e;
+  --status-yellow-bg: rgba(48, 39, 14, 1);
   --status-yellow-border: #8d711b;
-  --status-red-bg: #351717;
+  --status-red-bg: rgba(53, 23, 23, 1);
   --status-red-border: #963b42;
   --radius: 12px;
 }
-* {
-  box-sizing: border-box;
-}
+html { font-size: var(--dashboard-font-size); }
+* { box-sizing: border-box; }
 body {
   margin: 0;
-  padding: 24px;
-  background: var(--bg);
+  padding: 20px;
+  min-height: 100vh;
+  background: radial-gradient(circle at top right, var(--bg-glow), var(--bg) 55%);
+  background-color: var(--bg);
   color: var(--text);
-  font-family: Inter, "Segoe UI", Arial, sans-serif;
-  font-size: 14px;
+  font-family: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 1rem;
   line-height: 1.5;
+  transition: background-color 0.2s, color 0.2s;
 }
-main {
-  max-width: 1200px;
-  margin: 0 auto;
-}
+main { max-width: 1240px; margin: 0 auto; }
+.num { font-variant-numeric: tabular-nums; }
 /* Header */
 .header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 20px;
+  gap: 16px;
   flex-wrap: wrap;
-  padding: 6px 0 20px;
+  padding-bottom: 18px;
   border-bottom: 1px solid var(--border);
 }
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  min-width: 0;
-}
+.brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
 .brand-icon {
+  position: relative;
   width: 48px;
   height: 48px;
   flex: 0 0 48px;
   display: grid;
   place-items: center;
-  border: 1px solid #28664b;
+  border: 1px solid var(--status-green-border);
   border-radius: 13px;
-  background: #103023;
+  background: var(--status-green-bg);
   color: var(--green);
-  font-size: 24px;
+  font-size: 1.6rem;
+  cursor: pointer;
+  box-shadow: 0 0 20px rgba(74, 222, 128, 0.14);
+  transition: transform 0.15s, box-shadow 0.2s, border-color 0.2s;
+}
+.brand-icon:hover {
+  transform: translateY(-1px) scale(1.03);
+  border-color: var(--green);
+  box-shadow: 0 0 24px rgba(74, 222, 128, 0.28);
+}
+.brand-icon:active { transform: scale(0.96); }
+.brand-icon::after {
+  content: "⚙";
+  position: absolute;
+  right: -4px;
+  bottom: -4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 0.65rem;
+  display: grid;
+  place-items: center;
 }
 h1 {
   margin: 0;
-  font-size: clamp(20px, 3vw, 28px);
+  font-size: clamp(1.25rem, 2.4vw, 1.65rem);
   font-weight: 750;
-  letter-spacing: -.6px;
-  line-height: 1.3;
-  overflow-wrap: anywhere;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
 }
-.sub {
-  margin-top: 6px;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.7;
-}
-.sub strong {
-  color: var(--text-secondary);
-  font-weight: 500;
-}
+.sub { margin-top: 3px; color: var(--muted); font-size: 0.85rem; }
+.sub strong { color: var(--text-secondary); font-weight: 600; }
 .header-meta {
-  color: var(--muted);
-  font-size: 12px;
-  text-align: right;
-}
-.connection-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  margin-right: 6px;
-  border-radius: 50%;
-  background: var(--yellow);
-}
-.connection-dot.online {
-  background: var(--green);
-  box-shadow: 0 0 10px #4ade8050;
-}
-.connection-dot.offline {
-  background: var(--red);
-}
-/* Main alert */
-.alert {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  margin: 20px 0 12px;
-  padding: 15px 17px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--panel);
-  border-color: var(--border);
-}
-.alert-icon {
-  font-size: 19px;
-  line-height: 1.4;
-}
-.alert-title {
-  font-size: 14px;
-  font-weight: 750;
-}
-.alert-message {
-  margin-top: 4px;
-  font-size: 12px;
-  color: #b9c8dc;
-  line-height: 1.6;
-}
-.legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-  margin: 12px 2px 20px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 0.82rem;
 }
-.legend span {
+.conn-badge {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-glass);
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--text);
 }
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
+.connection-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--yellow); }
+.connection-dot.online { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.connection-dot.offline { background: var(--red); box-shadow: 0 0 8px var(--red); }
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 9px 14px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--button-bg);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.1s;
 }
-.dot-green { background: var(--green); }
-.dot-yellow { background: var(--yellow); }
-.dot-red { background: var(--red); }
-.dot-gray { background: #94a3b8; }
-/* Status colors */
-.level-green {
-  background: #10291e !important;
-  border-color: #216b48 !important;
+.btn:hover:not(:disabled) { background: var(--button-hover); color: var(--text); }
+.btn:active:not(:disabled) { transform: scale(0.98); }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn.active {
+  background: var(--button-active-bg);
+  border-color: var(--button-active-border);
   color: var(--green);
 }
-.level-yellow {
-  background: #30270e !important;
-  border-color: #8d711b !important;
-  color: var(--yellow);
-}
-.level-red {
-  background: #351717 !important;
-  border-color: #963b42 !important;
-  color: var(--red);
-}
-.level-gray {
-  background: var(--panel) !important;
-  border-color: #475569 !important;
-  color: #cbd5e1;
-}
-/* Metric cards */
-.grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin: 20px 0;
-}
-.card {
-  min-width: 0;
-  padding: 17px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--panel);
-  border-color: var(--border);
-  transition: background .2s, border-color .2s;
-}
-.card:hover {
-  background: var(--panel-hover);
-}
-.label {
-  color: var(--muted);
-  font-size: 12px;
-}
-.value {
-  margin-top: 9px;
-  font-size: clamp(21px, 2.5vw, 29px);
+.btn-power {
+  background: var(--status-green-bg);
+  border-color: var(--status-green-border);
+  color: var(--green);
   font-weight: 750;
-  line-height: 1.25;
-  letter-spacing: -.5px;
-  overflow-wrap: anywhere;
 }
-.unit {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 500;
-  letter-spacing: 0;
+.btn-power:hover:not(:disabled) {
+  filter: brightness(1.15);
+  background: var(--status-green-bg);
+  color: var(--green);
 }
-.note {
-  margin-top: 9px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.5;
-}
-/* Panels  */
-.panel {
-  margin: 18px 0;
-  padding: 18px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--panel);
-  border-color: var(--border);
-}
-h2 {
-  margin: 0 0 15px;
-  font-size: 16px;
-  font-weight: 700;
-}
-.section-heading {
+/* Alert Banner */
+.alert {
   display: flex;
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 12px;
-  margin: 25px 0 13px;
-}
-.section-heading h2 {
-  margin: 0;
-}
-.section-caption {
-  color: var(--muted);
-  font-size: 11px;
-}
-/* Display options */
-.options {
-  display: flex;
-  flex-wrap: wrap;
   gap: 12px 20px;
+  margin: 18px 0 14px;
+  padding: 13px 17px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-glass);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
-.options label {
+.alert-left { display: flex; align-items: center; gap: 12px; }
+.alert-icon { font-size: 1.15rem; line-height: 1; }
+.alert-title { font-size: 0.92rem; font-weight: 750; letter-spacing: 0.02em; }
+.alert-message { font-size: 0.84rem; color: var(--text-secondary); }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 0.78rem; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot-green { background: var(--green); }
+.dot-yellow { background: var(--yellow); }
+.dot-red { background: var(--red); }
+.dot-gray { background: var(--gray); }
+/* Unified 4-Column Pinned Overview Grid */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin: 14px 0;
+}
+.card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 15px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-glass);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  transition: transform 0.15s, border-color 0.15s, filter 0.15s;
+}
+.card:hover { transform: translateY(-1px); filter: brightness(1.06); }
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.label { color: var(--muted); font-size: 0.84rem; font-weight: 500; }
+.value {
+  margin-top: 8px;
+  font-size: clamp(1.4rem, 2.1vw, 1.85rem);
+  font-weight: 750;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+}
+.unit { color: var(--muted); font-size: 0.84rem; font-weight: 500; margin-left: 2px; }
+.note { margin-top: 8px; color: var(--muted); font-size: 0.76rem; line-height: 1.4; }
+/* Remote Control integrated cleanly into the 4-column grid */
+.remote-card {
+  grid-column: span 3;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 12px;
+}
+.remote-card:hover { transform: none; filter: none; }
+.remote-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  flex: 1;
+}
+.remote-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--button-bg);
+}
+.remote-item-label { font-size: 0.86rem; font-weight: 650; color: var(--text); }
+.remote-item .btn { min-width: 138px; min-height: 38px; }
+/* Status Themes (Placed AFTER .card and .alert) */
+.level-green { background: var(--status-green-bg); border-color: var(--status-green-border); color: var(--green); }
+.level-yellow { background: var(--status-yellow-bg); border-color: var(--status-yellow-border); color: var(--yellow); }
+.level-red { background: var(--status-red-bg); border-color: var(--status-red-border); color: var(--red); }
+.level-gray { background: var(--panel-glass); border-color: var(--border); color: var(--text-secondary); }
+/* Display Filters Bar */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 18px;
+  margin: 14px 0;
+  padding: 13px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-glass);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.filter-bar-title { font-size: 0.9rem; font-weight: 700; color: var(--text); }
+.filter-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  color: #d4deec;
-  font-size: 12px;
+  padding: 7px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--button-bg);
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 600;
   cursor: pointer;
+  user-select: none;
+  transition: all 0.15s;
 }
-input[type="checkbox"] {
-  accent-color: var(--accent);
+.chip input { position: absolute; opacity: 0; pointer-events: none; }
+.chip:hover { background: var(--button-hover); color: var(--text); }
+.chip.checked {
+  background: var(--button-active-bg);
+  border-color: var(--button-active-border);
+  color: var(--green);
+}
+.chip-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+/* Appearance Modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(5, 8, 16, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.modal-backdrop[hidden] { display: none !important; }
+.modal-card {
+  width: 100%;
+  max-width: 560px;
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 22px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-title { display: flex; align-items: center; gap: 10px; font-size: 1.05rem; font-weight: 750; }
+.modal-title-badge {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--status-green-bg);
+  border: 1px solid var(--status-green-border);
+  color: var(--green);
+}
+.setting-group { margin-top: 18px; }
+.setting-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--button-bg);
+}
+.seg-btn {
+  padding: 8px 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 650;
   cursor: pointer;
+  transition: 0.15s;
 }
-/* View selector */
+.seg-btn:hover { color: var(--text); }
+.seg-btn.active {
+  background: var(--panel);
+  border-color: var(--accent);
+  color: var(--text);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+.swatch-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.swatch-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 6px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--button-bg);
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.1s;
+}
+.swatch-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.swatch-card input[type="color"] {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 2px solid var(--border);
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  overflow: hidden;
+}
+.swatch-card input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+.swatch-card input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
+.swatch-name { font-size: 0.75rem; font-weight: 650; color: var(--text-secondary); }
+.swatch-hex { font-size: 0.7rem; font-family: monospace; color: var(--muted); }
+.slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--button-bg);
+}
+.slider-wrap input[type="range"] { flex: 1; accent-color: var(--accent); cursor: pointer; }
+.slider-pill {
+  min-width: 48px;
+  text-align: center;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+.modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+/* Hardware Monitoring Toolbar & Views */
 .view-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
-  margin: 18px 0 12px;
+  margin: 22px 0 12px;
+}
+.view-title { display: flex; align-items: center; gap: 10px; }
+.view-title h2 { margin: 0; font-size: 1.1rem; font-weight: 750; }
+.count-badge {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-glass);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
 }
 .view-switch {
   display: inline-flex;
@@ -572,811 +709,579 @@ input[type="checkbox"] {
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--button-bg);
-  border-color: var(--border);
 }
 .view-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  padding: 9px 13px;
+  padding: 7px 12px;
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 12px;
+  font-size: 0.82rem;
   font-weight: 650;
   cursor: pointer;
-  transition: .2s;
+  transition: 0.15s;
 }
-.view-btn:hover {
-  color: var(--text);
-  background: var(--button-hover);
-}
+.view-btn:hover { color: var(--text); background: var(--button-hover); }
 .view-btn.active {
-  color: #fff;
+  color: var(--green);
   background: var(--button-active-bg);
   border-color: var(--button-active-border);
 }
-.view-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.view-description {
-  color: var(--muted);
-  font-size: 11px;
-}
-/* Sensor table */
+/* Sensor Table */
 .wrap {
   width: 100%;
   overflow-x: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  background: var(--panel-glass);
+  backdrop-filter: blur(8px);
 }
-table {
-  width: 100%;
-  border-collapse: collapse;
-  background: var(--panel);
-  min-width: 590px;
-}
-td, th {
-  padding: 12px 14px;
-  border-bottom: 1px solid #293548;
+table { width: 100%; border-collapse: collapse; min-width: 580px; }
+th, td {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--table-border);
   text-align: left;
-  font-size: 12px;
-  overflow-wrap: anywhere;
-  border-bottom-color: var(--table-border);
+  font-size: 0.86rem;
 }
-th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: var(--table-header);
-  color: var(--muted);
-  font-weight: 650;
-  white-space: nowrap;
-}
-tbody tr:last-child td {
-  border-bottom: 0;
-}
-tbody tr:hover {
-  filter: brightness(1.12);
-}
-.sensor-row-green { background: #10291e; }
-.sensor-row-yellow { background: #30270e; }
-.sensor-row-red { background: #351717; }
-.sensor-row-gray { background: var(--panel); }
+th { background: var(--table-header); color: var(--muted); font-weight: 650; white-space: nowrap; }
+th.num-col, td.num-col { text-align: right; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover { filter: brightness(1.1); }
+.sensor-row-green { background: var(--status-green-bg); }
+.sensor-row-yellow { background: var(--status-yellow-bg); }
+.sensor-row-red { background: var(--status-red-bg); }
+.sensor-row-gray { background: transparent; }
 .status-pill {
   display: inline-block;
-  padding: 4px 8px;
+  padding: 3px 8px;
   border: 1px solid transparent;
   border-radius: 6px;
-  font-size: 10px;
+  font-size: 0.72rem;
   font-weight: 750;
+  letter-spacing: 0.03em;
   white-space: nowrap;
 }
-/* Connection information */
 .status {
-  margin-top: 16px;
-  padding: 12px 14px;
+  margin-top: 18px;
+  padding: 11px 14px;
   border: 1px solid var(--border);
   border-radius: 9px;
-  background: var(--button-bg);
-  border-color: var(--border);
+  background: var(--panel-glass);
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.7;
-  overflow-wrap: anywhere;
+  font-size: 0.78rem;
+  line-height: 1.6;
 }
 footer {
-  margin-top: 28px;
-  padding: 18px 0 4px;
+  margin-top: 22px;
+  padding: 16px 0 4px;
   border-top: 1px solid var(--border);
-  color: #718198;
-  font-size: 11px;
+  color: var(--muted);
+  font-size: 0.78rem;
   text-align: center;
 }
-footer strong {
-  color: var(--text-secondary);
-  font-weight: 600;
+footer strong { color: var(--text-secondary); }
+
+@media (max-width: 960px) {
+  .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .remote-card { grid-column: 1 / -1; }
 }
-/* Responsive layout */
-@media (max-width: 900px) {
-  .grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
+@media (max-width: 640px) {
+  body { padding: 12px; }
+  .header-meta { align-items: flex-start; }
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+  .remote-grid { grid-template-columns: 1fr; }
+  .swatch-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .card { padding: 13px; }
 }
-@media (max-width: 620px) {
-  body {
-    padding: 14px;
-  }
-  .header {
-    align-items: flex-start;
-  }
-  .brand {
-    align-items: flex-start;
-    gap: 10px;
-  }
-  .brand-icon {
-    width: 40px;
-    height: 40px;
-    flex-basis: 40px;
-    font-size: 20px;
-  }
-  .header-meta {
-    width: 100%;
-    text-align: left;
-  }
-  .grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 9px;
-  }
-  .card {
-    padding: 13px;
-  }
-  .value {
-    font-size: 22px;
-  }
-  .panel {
-    padding: 14px;
-  }
-  .options {
-    gap: 12px 15px;
-  }
-  .view-toolbar {
-    align-items: flex-start;
-  }
-}
-@media (max-width: 360px) {
-  body {
-    padding: 10px;
-  }
-  .grid {
-    grid-template-columns: 1fr;
-  }
-  .view-btn {
-    padding: 8px 9px;
-    font-size: 11px;
-  }
-}
-/* Appearance settings */
-.appearance-grid {
-  display: grid;
-  grid-template-columns:
-    repeat(auto-fit, minmax(160px, 1fr));
-  gap: 16px;
-}
-.appearance-grid label {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-  color: var(--text);
-  font-size: 12px;
-}
-.appearance-grid select,
-.appearance-grid input[type="color"] {
-  width: 100%;
-  min-height: 42px;
-  padding: 6px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--text);
-  font: inherit;
-}
-.appearance-grid input[type="color"] {
-  cursor: pointer;
-}
-.appearance-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 18px;
-}
-#appearancePanel select:focus-visible,
-#appearancePanel input:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-/* Transparency control */
-#appearancePanel input[type="range"] {
-  width: 100%;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-/* Translucent dashboard panels */
-.card,
-.panel,
-.alert {
-  background-color: var(--panel-glass, rgba(21, 31, 48, 0.55));
-  -webkit-backdrop-filter: blur(4px);
-  backdrop-filter: blur(4px);
-  transition: background-color 0.15s ease;
-}
-/* Appearance overrides */
-/* Use the selected panel color consistently */
-.card,
-.panel,
-.alert {
-  background: var(--panel) !important;
-  background-color: var(--panel) !important;
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-/* Keep alert and sensor status colors */
-.alert.level-green,
-.card.level-green {
-  background: var(--status-green-bg) !important;
-}
-.alert.level-yellow,
-.card.level-yellow {
-  background: var(--status-yellow-bg) !important;
-}
-.alert.level-red,
-.card.level-red {
-  background: var(--status-red-bg) !important;
-}
-.alert.level-gray,
-.card.level-gray {
-  background: var(--panel) !important;
-}
-/* Ensure text colors follow the selected theme */
-body {
-  color: var(--text);
-}
-.label,
-.note,
-.section-caption,
-.view-description {
-  color: var(--muted);
-}
-/* Apply selected font size throughout dashboard */
-body,
-body button,
-body input,
-body select,
-body textarea,
-body table,
-body th,
-body td,
-body h1,
-body h2,
-body .label,
-body .value,
-body .unit,
-body .note,
-body .sub,
-body .header-meta,
-body .alert-title,
-body .alert-message,
-body .status,
-body footer {
-  font-size: var(--dashboard-font-size) !important;
-}
-/* Preserve relative hierarchy */
-body h1 {
-  font-size: calc(var(--dashboard-font-size) * 1.8) !important;
-}
-body h2 {
-  font-size: calc(var(--dashboard-font-size) * 1.15) !important;
-}
-body .value {
-  font-size: calc(var(--dashboard-font-size) * 2) !important;
-}
-body .unit {
-  font-size: calc(var(--dashboard-font-size) * 0.85) !important;
+@media (max-width: 380px) {
+  .grid { grid-template-columns: 1fr; }
 }
 </style>
 </head>
 <body>
 <main>
-<!-- Dashboard Header -->
-<header class="header">
-  <div class="brand">
-    <div class="brand-icon">⌘</div>
-    <div>
-      <h1>RePOS: Remote Power Operation &amp; SCADA</h1>
-      <div class="sub">
-        Real-time PC Hardware Monitoring &amp; Remote Control
-        <br>
-        <strong>
-          Powered by LibreHardwareMonitor
-        </strong>
+  <!-- Header -->
+  <header class="header">
+    <div class="brand">
+      <button type="button" id="btnToggleAppearance" class="brand-icon"
+              title="Appearance &amp; Theme Settings" aria-label="Open Appearance Settings">
+        ⌘
+      </button>
+      <div>
+        <h1>RePOS: Remote Power Operation &amp; SCADA</h1>
+        <div class="sub">
+          Real-time PC Hardware Monitoring &amp; Remote Control ·
+          <strong>LibreHardwareMonitor</strong>
+        </div>
       </div>
     </div>
-  </div>
-  <div class="header-meta">
-    <div>
-      <span id="connectionDot" class="connection-dot"></span>
-      <span id="connectionText">Connecting...</span>
+    <div class="header-meta">
+      <div class="conn-badge">
+        <span id="connectionDot" class="connection-dot"></span>
+        <span id="connectionText">CONNECTING...</span>
+      </div>
+      <div>IP: <strong id="deviceIpLabel">--</strong> · Update: <span id="lastUpdate">--</span></div>
     </div>
-    <div style="margin-top:5px">
-      Device IP: <strong>192.168.1.115</strong>
-    </div>
-    <div id="lastUpdate" style="margin-top:3px">
-      Last update: --
-    </div>
-  </div>
-</header>
-<!-- System Alert -->
-<div id="alertBox" class="alert level-gray">
-  <div class="alert-icon" id="alertIcon">●</div>
-  <div>
-    <div class="alert-title" id="alertTitle">
-      WAITING FOR DATA
-    </div>
-    <div class="alert-message" id="alertMessage">
-      Waiting for hardware sensor data...
-    </div>
-  </div>
-</div>
-<div class="legend">
-  <span><i class="dot dot-green"></i> Normal</span>
-  <span><i class="dot dot-yellow"></i> Warning</span>
-  <span><i class="dot dot-red"></i> Critical</span>
-  <span><i class="dot dot-gray"></i> None</span>
-</div>
-<!-- Summary Metric Cards -->
-<div class="grid" id="metricGrid">
-  <div class="card power-card" id="cardCpuPower">
-    <div class="label">CPU Power</div>
-    <div class="value">
-      <span id="cpuPower">--</span>
-      <span class="unit">W</span>
-    </div>
-  </div>
-  <div class="card power-card" id="cardGpuPower">
-    <div class="label">GPU Power</div>
-    <div class="value">
-      <span id="gpuPower">--</span>
-      <span class="unit">W</span>
-    </div>
-  </div>
-  <div class="card power-card" id="cardTotalPower">
-    <div class="label">CPU + GPU Total Power</div>
-    <div class="value">
-      <span id="totalPower">--</span>
-      <span class="unit">W</span>
-    </div>
-  </div>
-  <div class="card power-card" id="cardDcPower">
-    <div class="label">PC Power Consumption</div>
-    <div class="value">
-      <span id="dcOutput">--</span>
-      <span class="unit">W</span>
-    </div>
-    <div class="note">Estimated PSU DC output</div>
-  </div>
-  <div class="card power-card" id="cardRealPower">
-    <div class="label">Actual Power Consumption</div>
-    <div class="value">
-      <span id="realPower">--</span>
-      <span class="unit">W</span>
-    </div>
-    <div class="note">
-      Estimated from DC output and PSU efficiency.
-      Not directly measured.
-    </div>
-  </div>
-  <div class="card power-card" id="cardEfficiency">
-    <div class="label">PSU Efficiency</div>
-    <div class="value">
-      <span id="psuEfficiency">--</span>
-      <span class="unit">%</span>
-    </div>
-  </div>
-  <div class="card env-card" id="cardAmbient">
-    <div class="label">PC Case Temperature</div>
-    <div class="value">
-      <span id="ambient">--</span>
-      <span class="unit">°C</span>
-    </div>
-    <div class="note">Read by BMP280</div>
-  </div>
-  <div class="card env-card" id="cardPressure">
-    <div class="label">PC Case Pressure</div>
-    <div class="value">
-      <span id="pressure">--</span>
-      <span class="unit">hPa</span>
-    </div>
-    <div class="note">Read by BMP280</div>
-  </div>
-</div>
-<!-- Appearance Settings -->
-<section class="panel" id="appearancePanel">
-  <h2>Appearance Settings</h2>
-  <div class="appearance-grid">
-    <label>
-      Theme
-      <select id="themeMode">
-        <option value="dark">Dark Mode</option>
-        <option value="light">Light Mode</option>
-        <option value="custom">Custom</option>
-      </select>
-    </label>
-    <label>
-      Background Color
-      <input type="color" id="bgColor"
-             value="#0b1120">
-    </label>
-    <label>
-      Panel Color
-      <input type="color" id="panelColor"
-             value="#151f30">
-    </label>
-    <label>
-      Text Color
-      <input type="color" id="textColor"
-             value="#e8eef8">
-    </label>
-    <label>
-      Secondary Text
-      <input type="color" id="mutedColor"
-             value="#93a4bb">
-    </label>
-    <label>
-      Accent Color
-      <input type="color" id="accentColor"
-             value="#60a5fa">
-    </label>
-    <label>
-      Font Size
-      <select id="fontSize">
-        <option value="12px">Small</option>
-        <option value="14px" selected>Normal</option>
-        <option value="16px">Large</option>
-        <option value="18px">Extra Large</option>
-      </select>
-    </label>
-    <label>
-  Transparency
-  <input
-    type="range"
-    id="transparency"
-    min="10"
-    max="100"
-    step="5"
-    value="85"
-  >
-  <span id="transparencyValue">55%</span>
-</label>
-  </div>
-  <div class="appearance-actions">
-    <button type="button" id="saveTheme"
-            class="view-btn active">
-      Save Settings
-    </button>
-    <button type="button" id="resetTheme"
-            class="view-btn">
-      Reset
-    </button>
-  </div>
-  <div class="note" id="themeMessage"
-       style="margin-top:12px">
-  </div>
-</section>
-<!-- PC Power Control -->
-<section class="panel" id="pcPowerPanel">
-  <h2>PC Power Control</h2>
-  <div style="display:flex;
-              align-items:center;
-              justify-content:space-between;
-              gap:16px;
-              flex-wrap:wrap">
-    <div>
-      <div id="pcPowerStatus"
-           class="note"
-           style="margin-top:8px">
+  </header>
+  <!-- System Alert + Legend -->
+  <div id="alertBox" class="alert level-gray">
+    <div class="alert-left">
+      <div class="alert-icon" id="alertIcon">●</div>
+      <div>
+        <div class="alert-title" id="alertTitle">WAITING FOR DATA</div>
+        <div class="alert-message" id="alertMessage">Waiting for hardware sensor data...</div>
       </div>
     </div>
-    <button type="button"
-            id="btnPcPower"
-            class="view-btn active"
-            style="min-width:190px;
-                   min-height:44px;
-                   background:#103023;
-                   border:1px solid #28664b;
-                   color:#4ade80">
-      ⏻ PC POWER
-    </button>
+    <div class="legend">
+      <span><i class="dot dot-green"></i> Normal</span>
+      <span><i class="dot dot-yellow"></i> Warning</span>
+      <span><i class="dot dot-red"></i> Critical</span>
+      <span><i class="dot dot-gray"></i> None</span>
+    </div>
   </div>
-</section>
-<!-- LCD Display Control -->
-<section class="panel">
-  <h2>LCD Display Control</h2>
-  <div style="display:flex;
-              align-items:center;
-              justify-content:space-between;
-              gap:16px;
-              flex-wrap:wrap">
-    <div>
-      <div style="font-weight:700">
-        Module: LCD I2C 16x2
+  <!-- Unified 4-Column Pinned Overview + Remote Control -->
+  <div class="grid" id="metricGrid">
+    <!-- Row 1: Power -->
+    <div class="card power-card" id="cardCpuPower">
+      <div class="card-head">
+        <div class="label">CPU Power</div>
+        <span class="status-pill level-gray" id="pillCpuPower">NONE</span>
       </div>
-      <div id="lcdStatusText"
-           class="note"
-           style="margin-top:5px">
-        Checking LCD status...
+      <div class="value num"><span id="cpuPower">--</span><span class="unit">W</span></div>
+    </div>
+    <div class="card power-card" id="cardGpuPower">
+      <div class="card-head">
+        <div class="label">GPU Power</div>
+        <span class="status-pill level-gray" id="pillGpuPower">NONE</span>
+      </div>
+      <div class="value num"><span id="gpuPower">--</span><span class="unit">W</span></div>
+    </div>
+    <div class="card power-card" id="cardTotalPower">
+      <div class="card-head">
+        <div class="label">CPU + GPU Total</div>
+        <span class="status-pill level-gray" id="pillTotalPower">NONE</span>
+      </div>
+      <div class="value num"><span id="totalPower">--</span><span class="unit">W</span></div>
+    </div>
+    <div class="card power-card" id="cardDcPower">
+      <div class="card-head">
+        <div class="label">PC Power (DC)</div>
+        <span class="status-pill level-gray" id="pillDcPower">NONE</span>
+      </div>
+      <div class="value num"><span id="dcOutput">--</span><span class="unit">W</span></div>
+    </div>
+    <!-- Row 2: Power & Environment -->
+    <div class="card power-card" id="cardRealPower">
+      <div class="card-head">
+        <div class="label">Actual Power (AC)</div>
+        <span class="status-pill level-gray" id="pillRealPower">NONE</span>
+      </div>
+      <div class="value num"><span id="realPower">--</span><span class="unit">W</span></div>
+    </div>
+    <div class="card power-card" id="cardEfficiency">
+      <div class="card-head">
+        <div class="label">PSU Efficiency</div>
+        <span class="status-pill level-gray" id="pillEfficiency">NONE</span>
+      </div>
+      <div class="value num"><span id="psuEfficiency">--</span><span class="unit">%</span></div>
+    </div>
+    <div class="card env-card" id="cardAmbient">
+      <div class="card-head">
+        <div class="label">PC Case Temperature</div>
+        <span class="status-pill level-gray" id="pillAmbient">NONE</span>
+      </div>
+      <div class="value num"><span id="ambient">--</span><span class="unit">°C</span></div>
+    </div>
+    <div class="card env-card" id="cardPressure">
+      <div class="card-head">
+        <div class="label">PC Case Pressure</div>
+        <span class="status-pill level-gray" id="pillPressure">NONE</span>
+      </div>
+      <div class="value num"><span id="pressure">--</span><span class="unit">hPa</span></div>
+    </div>
+    <!-- Row 3: CPU Temps + GPU Core -->
+    <div class="card" id="cardCpuCoreMax">
+      <div class="card-head">
+        <div class="label">CPU Core Max</div>
+        <span class="status-pill level-gray" id="pillCpuCoreMax">NONE</span>
+      </div>
+      <div class="value num"><span id="cpuCoreMax">--</span><span class="unit">°C</span></div>
+    </div>
+    <div class="card" id="cardCpuCoreAvg">
+      <div class="card-head">
+        <div class="label">CPU Core Average</div>
+        <span class="status-pill level-gray" id="pillCpuCoreAvg">NONE</span>
+      </div>
+      <div class="value num"><span id="cpuCoreAvg">--</span><span class="unit">°C</span></div>
+    </div>
+    <div class="card" id="cardCpuPackage">
+      <div class="card-head">
+        <div class="label">CPU Package</div>
+        <span class="status-pill level-gray" id="pillCpuPackage">NONE</span>
+      </div>
+      <div class="value num"><span id="cpuPackage">--</span><span class="unit">°C</span></div>
+    </div>
+    <div class="card" id="cardGpuCoreTemp">
+      <div class="card-head">
+        <div class="label">GPU Core</div>
+        <span class="status-pill level-gray" id="pillGpuCoreTemp">NONE</span>
+      </div>
+      <div class="value num"><span id="gpuCoreTemp">--</span><span class="unit">°C</span></div>
+    </div>
+    <!-- Row 4: GPU Temps + CPU/Case Fans -->
+    <div class="card" id="cardGpuHotspot">
+      <div class="card-head">
+        <div class="label">GPU Hot Spot</div>
+        <span class="status-pill level-gray" id="pillGpuHotspot">NONE</span>
+      </div>
+      <div class="value num"><span id="gpuHotspot">--</span><span class="unit">°C</span></div>
+    </div>
+    <div class="card" id="cardGpuMemJunction">
+      <div class="card-head">
+        <div class="label">GPU Memory Junction</div>
+        <span class="status-pill level-gray" id="pillGpuMemJunction">NONE</span>
+      </div>
+      <div class="value num"><span id="gpuMemJunction">--</span><span class="unit">°C</span></div>
+    </div>
+    <div class="card" id="cardCpuFan">
+      <div class="card-head">
+        <div class="label">CPU Fan</div>
+        <span class="status-pill level-gray" id="pillCpuFan">NONE</span>
+      </div>
+      <div class="value num"><span id="cpuFan">--</span><span class="unit">RPM</span></div>
+    </div>
+    <div class="card" id="cardCaseFan">
+      <div class="card-head">
+        <div class="label">Case Fan</div>
+        <span class="status-pill level-gray" id="pillCaseFan">NONE</span>
+      </div>
+      <div class="value num"><span id="caseFan">--</span><span class="unit">RPM</span></div>
+    </div>
+    <!-- Row 5: GPU Fan + Remote Hardware Control -->
+    <div class="card" id="cardGpuFan">
+      <div class="card-head">
+        <div class="label">GPU Fan</div>
+        <span class="status-pill level-gray" id="pillGpuFan">NONE</span>
+      </div>
+      <div class="value num"><span id="gpuFan">--</span><span class="unit">RPM</span></div>
+    </div>
+    <section class="card remote-card">
+      <div class="label" style="font-weight:700;color:var(--text)">Remote Hardware Control</div>
+      <div class="remote-grid">
+        <div class="remote-item">
+          <span class="remote-item-label">Power Switch</span>
+          <button type="button" id="btnPcPower" class="btn btn-power">
+            PC POWER
+          </button>
+        </div>
+        <div class="remote-item">
+          <span class="remote-item-label">LCD</span>
+          <button type="button" id="btnLcdToggle" class="btn active">
+            LCD: ON
+          </button>
+        </div>
+      </div>
+    </section>
+  </div>
+  <!-- Display Filters Bar -->
+  <section class="filter-bar">
+    <span class="filter-bar-title">Display Filters</span>
+    <div class="filter-chips">
+      <label class="chip checked" for="optPower">
+        <input type="checkbox" id="optPower" checked>
+        <span class="chip-dot"></span> Power
+      </label>
+      <label class="chip checked" for="optVoltage">
+        <input type="checkbox" id="optVoltage" checked>
+        <span class="chip-dot"></span> Voltage
+      </label>
+      <label class="chip checked" for="optTemp">
+        <input type="checkbox" id="optTemp" checked>
+        <span class="chip-dot"></span> Temperature
+      </label>
+      <label class="chip checked" for="optFan">
+        <input type="checkbox" id="optFan" checked>
+        <span class="chip-dot"></span> Fan Speed
+      </label>
+      <label class="chip checked" for="optEnv">
+        <input type="checkbox" id="optEnv" checked>
+        <span class="chip-dot"></span> Environment
+      </label>
+    </div>
+  </section>
+  <!-- Detailed Sensor Monitoring -->
+  <div class="view-toolbar">
+    <div class="view-title">
+      <h2>Hardware Monitoring (Details)</h2>
+      <span class="count-badge" id="sensorCount">0 sensors</span>
+    </div>
+    <div class="view-switch" role="group" aria-label="Dashboard display mode">
+      <button type="button" class="view-btn active" id="btnCardView" aria-pressed="true">
+        ⊞ Card View
+      </button>
+      <button type="button" class="view-btn" id="btnTableView" aria-pressed="false">
+        ≡ Table View
+      </button>
+    </div>
+  </div>
+  <!-- Card View -->
+  <section id="sensorCardView">
+    <div class="grid" id="sensorCards">
+      <div class="card">
+        <div class="label">Sensor data</div>
+        <div class="note">Waiting for sensor data...</div>
       </div>
     </div>
-    <button
-      type="button"
-      id="btnLcdToggle"
-      class="view-btn active"
-      style="min-width:120px">
-      LCD: ON
-    </button>
-  </div>
-</section>
-<!-- Display Filters -->
-<section class="panel">
-  <h2>Display Options</h2>
-  <div class="options">
-    <label>
-      <input type="checkbox" id="optPower" checked>
-      Power
-    </label>
-    <label>
-      <input type="checkbox" id="optVoltage" checked>
-      Voltage
-    </label>
-    <label>
-      <input type="checkbox" id="optTemp" checked>
-      Temperature
-    </label>
-    <label>
-      <input type="checkbox" id="optFan" checked>
-      Fan Speed
-    </label>
-    <label>
-      <input type="checkbox" id="optEnv" checked>
-      Environment
-    </label>
-  </div>
-</section>
-<!-- Sensor Display / View Selector -->
-<div class="view-toolbar">
-  <div>
-    <div style="font-size:15px;font-weight:700">
-      Hardware Monitoring
+  </section>
+  <!-- Table View -->
+  <section id="sensorTableView" hidden>
+    <div class="wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Device</th>
+            <th>Sensor</th>
+            <th class="num-col">Value</th>
+            <th>Unit</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="5">Waiting for sensor data...</td></tr>
+        </tbody>
+      </table>
     </div>
-    <div class="view-description">
+  </section>
+  <div class="status" id="status">Connecting to MCU...</div>
+  <footer>
+    RePOS: Remote Power Operation &amp; SCADA · Developed by <strong>Chu Xuân Hồng</strong>
+  </footer>
+</main>
+<!-- Appearance Settings Modal (Opened via ⌘ Icon) -->
+<div class="modal-backdrop" id="appearanceModal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="appearanceTitle">
+    <div class="modal-header">
+      <div class="modal-title" id="appearanceTitle">
+        <span class="modal-title-badge">⌘</span>
+        <span>Appearance Settings</span>
+      </div>
+      <button type="button" id="btnCloseAppearance" class="btn" style="padding:5px 10px">✕</button>
     </div>
-  </div>
-  <div class="view-switch" role="group"
-       aria-label="Dashboard display mode">
-    <button
-      type="button"
-      class="view-btn active"
-      id="btnCardView"
-      aria-pressed="true">
-      ⊞ Card View
-    </button>
-    <button
-      type="button"
-      class="view-btn"
-      id="btnTableView"
-      aria-pressed="false">
-      ≡ Table View
-    </button>
+    <div class="setting-group">
+      <div class="setting-label"><span>Theme Preset</span></div>
+      <div class="segmented" id="themePresetGroup">
+        <button type="button" class="seg-btn active" data-mode="dark">Dark</button>
+        <button type="button" class="seg-btn" data-mode="midnight">Midnight</button>
+        <button type="button" class="seg-btn" data-mode="light">Light</button>
+        <button type="button" class="seg-btn" data-mode="custom">Custom</button>
+      </div>
+    </div>
+    <div class="setting-group">
+      <div class="setting-label"><span>Color Palette</span></div>
+      <div class="swatch-grid">
+        <label class="swatch-card">
+          <input type="color" id="bgColor" value="#0b1120">
+          <span class="swatch-name">Background</span>
+          <span class="swatch-hex" id="bgColorHex">#0b1120</span>
+        </label>
+        <label class="swatch-card">
+          <input type="color" id="panelColor" value="#151f30">
+          <span class="swatch-name">Panels</span>
+          <span class="swatch-hex" id="panelColorHex">#151f30</span>
+        </label>
+        <label class="swatch-card">
+          <input type="color" id="textColor" value="#e8eef8">
+          <span class="swatch-name">Text</span>
+          <span class="swatch-hex" id="textColorHex">#e8eef8</span>
+        </label>
+        <label class="swatch-card">
+          <input type="color" id="mutedColor" value="#93a4bb">
+          <span class="swatch-name">Muted</span>
+          <span class="swatch-hex" id="mutedColorHex">#93a4bb</span>
+        </label>
+        <label class="swatch-card">
+          <input type="color" id="accentColor" value="#60a5fa">
+          <span class="swatch-name">Accent</span>
+          <span class="swatch-hex" id="accentColorHex">#60a5fa</span>
+        </label>
+      </div>
+    </div>
+    <div class="setting-group">
+      <div class="setting-label"><span>Font Size</span></div>
+      <div class="segmented" id="fontSizeGroup">
+        <button type="button" class="seg-btn" data-size="12px">Small</button>
+        <button type="button" class="seg-btn active" data-size="14px">Normal</button>
+        <button type="button" class="seg-btn" data-size="16px">Large</button>
+        <button type="button" class="seg-btn" data-size="18px">XL</button>
+      </div>
+    </div>
+    <div class="setting-group">
+      <div class="setting-label">
+        <span>Panel Transparency</span>
+        <span style="text-transform:none;font-weight:500">0% solid – 100% clear</span>
+      </div>
+      <div class="slider-wrap">
+        <input type="range" id="transparency" min="0" max="100" step="1" value="0">
+        <span id="transparencyValue" class="slider-pill num">0%</span>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <div style="display:flex;gap:8px;align-items:center">
+        <button type="button" id="resetTheme" class="btn">Reset Default</button>
+        <span class="note" id="themeMessage" style="margin:0"></span>
+      </div>
+      <button type="button" id="saveTheme" class="btn active">Save</button>
+    </div>
   </div>
 </div>
-<!-- Card View -->
-<section id="sensorCardView">
-  <div class="section-heading">
-    <h2>Details:</h2>
-    <span class="section-caption" id="cardSensorCount">
-      0 sensors
-    </span>
-  </div>
-  <div class="grid" id="sensorCards">
-    <div class="card">
-      <div class="label">Sensor data</div>
-      <div class="note">Waiting for sensor data...</div>
-    </div>
-  </div>
-</section>
-<!-- Table View -->
-<section id="sensorTableView" hidden>
-  <div class="section-heading">
-    <h2>Sensor Data Table</h2>
-    <span class="section-caption" id="tableSensorCount">
-      0 sensors
-    </span>
-  </div>
-  <div class="wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Device</th>
-          <th>Sensor</th>
-          <th>Value</th>
-          <th>Unit</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody id="rows">
-        <tr>
-          <td colspan="5">Waiting for sensor data...</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-</section>
-<!-- Connection Status -->
-<div class="status" id="status">
-  Connecting to MCU...
-</div>
-<!-- Footer -->
-<footer>
-  RePOS: Remote Power Operation &amp; SCADA
-  <br>
-  Developed by <strong>Chu Xuân Hồng</strong>
-</footer>
 <script>
 const $ = id => document.getElementById(id);
 let current = null;
 let currentView = 'card';
+let currentMode = 'dark';
+let currentFontSize = '14px';
+let isRefreshing = false;
+let lastCardSig = '';
+let cardRefs = [];
+let lastTableSig = '';
+let rowRefs = [];
 const SENSOR_FILTERS = {
   power: 'optPower',
   voltage: 'optVoltage',
   temperature: 'optTemp',
   fan: 'optFan'
 };
-// Number formatting
-function num(value) {
-  if (value === null || value === undefined || value === '') {
-    return NaN;
-  }
-  const result = Number(value);
-  return Number.isFinite(result) ? result : NaN;
+function num(v) {
+  if (v === null || v === undefined || v === '') return NaN;
+  const r = Number(v);
+  return Number.isFinite(r) ? r : NaN;
 }
-function fmt(value) {
-  return Number.isFinite(value) ? value.toFixed(2) : '--';
-}
-function getLevel(value, yellow, red) {
-  if (!Number.isFinite(value)) return -1;
-  if (value >= red) return 2;
-  if (value >= yellow) return 1;
+function fmt(v) { return Number.isFinite(v) ? v.toFixed(2) : '--'; }
+function getLevel(v, y, r) {
+  if (!Number.isFinite(v)) return -1;
+  if (v >= r) return 2;
+  if (v >= y) return 1;
   return 0;
 }
-// Status styling
-function levelClass(level) {
-  if (level === 0) return 'level-green';
-  if (level === 1) return 'level-yellow';
-  if (level === 2) return 'level-red';
-  return 'level-gray';
+function levelClass(l) {
+  return l === 0 ? 'level-green' : l === 1 ? 'level-yellow' : l === 2 ? 'level-red' : 'level-gray';
 }
-function rowClass(level) {
-  if (level === 0) return 'sensor-row-green';
-  if (level === 1) return 'sensor-row-yellow';
-  if (level === 2) return 'sensor-row-red';
-  return 'sensor-row-gray';
+function rowClass(l) {
+  return l === 0 ? 'sensor-row-green' : l === 1 ? 'sensor-row-yellow' : l === 2 ? 'sensor-row-red' : 'sensor-row-gray';
 }
-function alertText(level) {
-  if (level === 0) return 'NORMAL';
-  if (level === 1) return 'WARNING';
-  if (level === 2) return 'CRITICAL';
-  return 'NONE';
+function alertText(l) {
+  return l === 0 ? 'NORMAL' : l === 1 ? 'WARNING' : l === 2 ? 'CRITICAL' : 'NONE';
 }
-function updateCard(id, level) {
+function setTextIfChanged(el, txt) {
+  if (el && el.textContent !== txt) el.textContent = txt;
+}
+function updateCard(id, level, pillId) {
   const card = $(id);
-  if (!card) return;
-  card.classList.remove(
-    'level-green',
-    'level-yellow',
-    'level-red',
-    'level-gray'
-  );
-  card.classList.add(levelClass(level));
+  const lc = levelClass(level);
+  if (card && !card.classList.contains(lc)) {
+    card.classList.remove('level-green', 'level-yellow', 'level-red', 'level-gray');
+    card.classList.add(lc);
+  }
+  if (pillId) {
+    const pill = $(pillId);
+    if (pill) {
+      const nextCls = 'status-pill ' + lc;
+      if (pill.className !== nextCls) pill.className = nextCls;
+      setTextIfChanged(pill, alertText(level));
+    }
+  }
 }
-// Connection indicator
+function updatePinnedMetric(cardId, valueId, pillId, value, yellow, red) {
+  setTextIfChanged($(valueId), fmt(value));
+  const level = getLevel(value, yellow, red);
+  updateCard(cardId, level, pillId);
+  return level;
+}
 function setConnection(online, message) {
-  $('connectionDot').className =
-    'connection-dot ' + (online ? 'online' : 'offline');
-  $('connectionText').textContent = message;
+  $('connectionDot').className = 'connection-dot ' + (online ? 'online' : 'offline');
+  setTextIfChanged($('connectionText'), message);
 }
-// Main system alert
 function updateMainAlert(level, message) {
-  $('alertBox').className = 'alert ' + levelClass(level);
-  $('alertIcon').textContent =
-    level === 0 ? '●' :
-    level === 1 ? '▲' :
-    level === 2 ? '■' : '○';
-  $('alertTitle').textContent =
+  const nextCls = 'alert ' + levelClass(level);
+  if ($('alertBox').className !== nextCls) $('alertBox').className = nextCls;
+  setTextIfChanged($('alertIcon'), level === 0 ? '●' : level === 1 ? '▲' : level === 2 ? '■' : '○');
+  setTextIfChanged($('alertTitle'),
     level === 0 ? 'SYSTEM NORMAL' :
     level === 1 ? 'WARNING DETECTED' :
-    level === 2 ? 'CRITICAL CONDITION' :
-    'WAITING FOR DATA';
-  $('alertMessage').textContent = message;
+    level === 2 ? 'CRITICAL CONDITION' : 'WAITING FOR DATA');
+  setTextIfChanged($('alertMessage'), message);
 }
-// Sensor classification
 function getSensorLevel(sensor) {
-  const type = String(
-    sensor.type ?? sensor.Type ?? ''
-  ).toLowerCase();
-  const name = String(
-    sensor.name ?? sensor.Name ?? ''
-  ).toLowerCase();
+  const type = String(sensor.type ?? sensor.Type ?? '').toLowerCase();
+  const name = String(sensor.name ?? sensor.Name ?? '').toLowerCase();
   const value = num(sensor.value ?? sensor.Value);
   if (!Number.isFinite(value)) return -1;
-  if (type === 'temperature') {
-    return getLevel(value, 75, 95);
-  }
-  if (type === 'fan') {
-    return getLevel(value, 2000, 2700);
-  }
+  if (type === 'temperature') return getLevel(value, 75, 95);
+  if (type === 'fan') return getLevel(value, 2000, 2700);
   if (type === 'voltage') {
-    if (name.includes('12v') || name.includes('12 v')) {
-      return getLevel(value, 12.60, 12.90);
-    }
-    if (name.includes('5v') || name.includes('5 v')) {
-      return getLevel(value, 5.25, 5.50);
-    }
-    if (
-      name.includes('3.3v') ||
-      name.includes('3.3 v') ||
-      name.includes('3v')
-    ) {
+    if (name.includes('12v') || name.includes('12 v')) return getLevel(value, 12.60, 12.90);
+    if (name.includes('5v') || name.includes('5 v')) return getLevel(value, 5.25, 5.50);
+    if (name.includes('3.3v') || name.includes('3.3 v') || name.includes('3v')) {
       return getLevel(value, 3.465, 3.60);
     }
   }
   return -1;
 }
-// Sensor metadata
-function getSensorType(sensor) {
-  return String(sensor.type ?? sensor.Type ?? 'Other');
-}
-function getSensorName(sensor) {
-  return String(sensor.name ?? sensor.Name ?? 'Unknown');
-}
-function getSensorDevice(sensor) {
-  return String(sensor.device ?? sensor.Device ?? 'Unknown');
-}
-function getSensorValue(sensor) {
-  return num(sensor.value ?? sensor.Value);
-}
-function getSensorUnit(sensor) {
-  if (sensor.unit || sensor.Unit) {
-    return String(sensor.unit || sensor.Unit);
-  }
-  const type = getSensorType(sensor).toLowerCase();
-  if (type === 'power') return 'W';
-  if (type === 'voltage') return 'V';
-  if (type === 'temperature') return '°C';
-  if (type === 'fan') return 'RPM';
-  if (type === 'clock') return 'MHz';
-  if (type === 'load') return '%';
+function getSensorType(s) { return String(s.type ?? s.Type ?? 'Other'); }
+function getSensorName(s) { return String(s.name ?? s.Name ?? 'Unknown'); }
+function getSensorDevice(s) { return String(s.device ?? s.Device ?? 'Unknown'); }
+function getSensorValue(s) { return num(s.value ?? s.Value); }
+function getSensorUnit(s) {
+  if (s.unit || s.Unit) return String(s.unit || s.Unit);
+  const t = getSensorType(s).toLowerCase();
+  if (t === 'power') return 'W';
+  if (t === 'voltage') return 'V';
+  if (t === 'temperature') return '°C';
+  if (t === 'fan') return 'RPM';
+  if (t === 'clock') return 'MHz';
+  if (t === 'load') return '%';
   return '';
 }
-function getSensorCategory(sensor) {
-  const type = getSensorType(sensor).toLowerCase();
-  if (type === 'power') return 'power';
-  if (type === 'voltage') return 'voltage';
-  if (type === 'temperature') return 'temperature';
-  if (type === 'fan') return 'fan';
-  return 'other';
+function getSensorCategory(s) {
+  const t = getSensorType(s).toLowerCase();
+  return (t === 'power' || t === 'voltage' || t === 'temperature' || t === 'fan') ? t : 'other';
 }
-// Display filters
-function sensorPassesFilter(sensor) {
-  const category = getSensorCategory(sensor);
-  if (category === 'other') return true;
-  const checkboxId = SENSOR_FILTERS[category];
-  return checkboxId ? $(checkboxId).checked : true;
+function sensorPassesFilter(s) {
+  const cat = getSensorCategory(s);
+  if (cat === 'other') return true;
+  const id = SENSOR_FILTERS[cat];
+  return id ? $(id).checked : true;
+}
+function isCpuDev(d) {
+  return d.includes('ryzen') || d.includes('epyc') || d.includes('threadripper') ||
+         d.includes('athlon') || d.includes('cpu') || (d.includes('intel') && !d.includes('arc'));
+}
+function isGpuDev(d) {
+  return d.includes('nvidia') || d.includes('geforce') || d.includes('quadro') ||
+         d.includes('rtx') || d.includes('gtx') || d.includes('radeon') || d.includes('arc');
+}
+function isNuvotonDev(d) {
+  return d.includes('nuvoton') || d.includes('nct6798d');
+}
+function findSensorVal(sensors, predicate) {
+  for (const s of sensors) {
+    const t = getSensorType(s).toLowerCase();
+    const d = getSensorDevice(s).toLowerCase();
+    const n = getSensorName(s).toLowerCase();
+    if (predicate(t, d, n)) {
+      const v = getSensorValue(s);
+      if (Number.isFinite(v)) return v;
+    }
+  }
+  return NaN;
 }
 function showMetricCards() {
   const showPower = $('optPower').checked;
-  const showEnvironment = $('optEnv').checked;
-  document.querySelectorAll('.power-card').forEach(card => {
-    card.style.display = showPower ? '' : 'none';
-  });
-  document.querySelectorAll('.env-card').forEach(card => {
-    card.style.display = showEnvironment ? '' : 'none';
-  });
+  const showEnv = $('optEnv').checked;
+  document.querySelectorAll('.power-card').forEach(c => { c.style.display = showPower ? '' : 'none'; });
+  document.querySelectorAll('.env-card').forEach(c => { c.style.display = showEnv ? '' : 'none'; });
 }
-// View switching
 function setView(view) {
   currentView = view === 'table' ? 'table' : 'card';
   const isCard = currentView === 'card';
@@ -1384,368 +1289,397 @@ function setView(view) {
   $('sensorTableView').hidden = isCard;
   $('btnCardView').classList.toggle('active', isCard);
   $('btnTableView').classList.toggle('active', !isCard);
-  $('btnCardView').setAttribute(
-    'aria-pressed',
-    String(isCard)
-  );
-  $('btnTableView').setAttribute(
-    'aria-pressed',
-    String(!isCard)
-  );
-  if (current) {
-    renderSensorViews(current);
-  }
+  $('btnCardView').setAttribute('aria-pressed', String(isCard));
+  $('btnTableView').setAttribute('aria-pressed', String(!isCard));
+  if (current) renderSensorViews(current);
 }
-// HTML cell
-function addCell(row, text) {
+function addCell(row, text, className) {
   const cell = document.createElement('td');
+  if (className) cell.className = className;
   cell.textContent = String(text);
   row.appendChild(cell);
   return cell;
 }
-// Card view rendering
+// In-Place DOM Patching for Sensor Cards
 function renderSensorCards(sensors) {
   const container = $('sensorCards');
-  container.replaceChildren();
-  $('cardSensorCount').textContent =
-    sensors.length + (sensors.length === 1 ? ' sensor' : ' sensors');
   if (sensors.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'card';
-    empty.textContent =
-      'No sensors available for the selected filters.';
-    container.appendChild(empty);
+    if (lastCardSig !== '__empty__') {
+      lastCardSig = '__empty__';
+      cardRefs = [];
+      const empty = document.createElement('div');
+      empty.className = 'card';
+      empty.textContent = 'No sensors available for the selected filters.';
+      container.replaceChildren(empty);
+    }
     return;
   }
-  sensors.forEach(sensor => {
-    const type = getSensorType(sensor);
-    const name = getSensorName(sensor);
-    const device = getSensorDevice(sensor);
-    const value = getSensorValue(sensor);
-    const unit = getSensorUnit(sensor);
+  const sig = sensors.map(s =>
+    getSensorDevice(s) + '\0' + getSensorName(s) + '\0' + getSensorUnit(s)
+  ).join('\n');
+  if (sig !== lastCardSig) {
+    lastCardSig = sig;
+    cardRefs = [];
+    const frag = document.createDocumentFragment();
+    sensors.forEach(sensor => {
+      const card = document.createElement('div');
+      card.className = 'card level-gray';
+      const head = document.createElement('div');
+      head.className = 'card-head';
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = getSensorName(sensor);
+      const pill = document.createElement('span');
+      pill.className = 'status-pill level-gray';
+      pill.textContent = 'NONE';
+      head.appendChild(label);
+      head.appendChild(pill);
+      const reading = document.createElement('div');
+      reading.className = 'value num';
+      const valNode = document.createTextNode('--');
+      reading.appendChild(valNode);
+      const unit = getSensorUnit(sensor);
+      if (unit) {
+        const unitSpan = document.createElement('span');
+        unitSpan.className = 'unit';
+        unitSpan.textContent = unit;
+        reading.appendChild(unitSpan);
+      }
+      const note = document.createElement('div');
+      note.className = 'note';
+      note.textContent = getSensorDevice(sensor) + ' · ' + getSensorType(sensor);
+      card.appendChild(head);
+      card.appendChild(reading);
+      card.appendChild(note);
+      frag.appendChild(card);
+      cardRefs.push({ card, pill, valNode });
+    });
+    container.replaceChildren(frag);
+  }
+  for (let i = 0; i < sensors.length; i++) {
+    const sensor = sensors[i];
+    const ref = cardRefs[i];
     const level = getSensorLevel(sensor);
-    const card = document.createElement('div');
-    card.className = 'card ' + levelClass(level);
-    const label = document.createElement('div');
-    label.className = 'label';
-    label.textContent = name;
-    const reading = document.createElement('div');
-    reading.className = 'value';
-    reading.textContent = fmt(value);
-    if (unit) {
-      const unitSpan = document.createElement('span');
-      unitSpan.className = 'unit';
-      unitSpan.textContent = ' ' + unit;
-      reading.appendChild(unitSpan);
-    }
-    const note = document.createElement('div');
-    note.className = 'note';
-    note.textContent = device + ' · ' + type;
-    const status = document.createElement('div');
-    status.style.marginTop = '10px';
-    const pill = document.createElement('span');
-    pill.className = 'status-pill ' + levelClass(level);
-    pill.textContent = alertText(level);
-    status.appendChild(pill);
-    card.appendChild(label);
-    card.appendChild(reading);
-    card.appendChild(note);
-    card.appendChild(status);
-    container.appendChild(card);
-  });
+    const lc = levelClass(level);
+    const nextCardCls = 'card ' + lc;
+    if (ref.card.className !== nextCardCls) ref.card.className = nextCardCls;
+    const nextPillCls = 'status-pill ' + lc;
+    if (ref.pill.className !== nextPillCls) ref.pill.className = nextPillCls;
+    const txtLevel = alertText(level);
+    if (ref.pill.textContent !== txtLevel) ref.pill.textContent = txtLevel;
+    const txtVal = fmt(getSensorValue(sensor));
+    if (ref.valNode.nodeValue !== txtVal) ref.valNode.nodeValue = txtVal;
+  }
 }
-// Table view rendering
+// In-Place DOM Patching for Sensor Table
 function renderSensorTable(sensors) {
   const rows = $('rows');
-  rows.replaceChildren();
-  $('tableSensorCount').textContent =
-    sensors.length + (sensors.length === 1 ? ' sensor' : ' sensors');
   if (sensors.length === 0) {
-    const tr = document.createElement('tr');
-    const td = addCell(
-      tr,
-      'No sensors available for the selected filters.'
-    );
-    td.colSpan = 5;
-    rows.appendChild(tr);
+    if (lastTableSig !== '__empty__') {
+      lastTableSig = '__empty__';
+      rowRefs = [];
+      const tr = document.createElement('tr');
+      const td = addCell(tr, 'No sensors available for the selected filters.');
+      td.colSpan = 5;
+      rows.replaceChildren(tr);
+    }
     return;
   }
-  sensors.forEach(sensor => {
-    const tr = document.createElement('tr');
+  const sig = sensors.map(s =>
+    getSensorDevice(s) + '\0' + getSensorName(s) + '\0' + getSensorUnit(s)
+  ).join('\n');
+  if (sig !== lastTableSig) {
+    lastTableSig = sig;
+    rowRefs = [];
+    const frag = document.createDocumentFragment();
+    sensors.forEach(sensor => {
+      const tr = document.createElement('tr');
+      addCell(tr, getSensorDevice(sensor));
+      addCell(tr, getSensorName(sensor));
+      const valCell = addCell(tr, '--', 'num num-col');
+      addCell(tr, getSensorUnit(sensor));
+      const statusCell = document.createElement('td');
+      const pill = document.createElement('span');
+      pill.className = 'status-pill level-gray';
+      pill.textContent = 'NONE';
+      statusCell.appendChild(pill);
+      tr.appendChild(statusCell);
+      frag.appendChild(tr);
+      rowRefs.push({ tr, valCell, pill });
+    });
+    rows.replaceChildren(frag);
+  }
+  for (let i = 0; i < sensors.length; i++) {
+    const sensor = sensors[i];
+    const ref = rowRefs[i];
     const level = getSensorLevel(sensor);
-    tr.className = rowClass(level);
-    addCell(tr, getSensorDevice(sensor));
-    addCell(tr, getSensorName(sensor));
-    addCell(tr, fmt(getSensorValue(sensor)));
-    addCell(tr, getSensorUnit(sensor));
-    const statusCell = document.createElement('td');
-    const pill = document.createElement('span');
-    pill.className = 'status-pill ' + levelClass(level);
-    pill.textContent = alertText(level);
-    statusCell.appendChild(pill);
-    tr.appendChild(statusCell);
-    rows.appendChild(tr);
-  });
-}
-// Render both sensor views
-function renderSensorViews(data) {
-  const allSensors = Array.isArray(data.sensors)
-    ? data.sensors
-    : [];
-  const filteredSensors = allSensors.filter(
-    sensorPassesFilter
-  );
-  if (currentView === 'card') {
-    renderSensorCards(filteredSensors);
-  } else {
-    renderSensorTable(filteredSensors);
+    const nextRowCls = rowClass(level);
+    if (ref.tr.className !== nextRowCls) ref.tr.className = nextRowCls;
+    setTextIfChanged(ref.valCell, fmt(getSensorValue(sensor)));
+    const nextPillCls = 'status-pill ' + levelClass(level);
+    if (ref.pill.className !== nextPillCls) ref.pill.className = nextPillCls;
+    setTextIfChanged(ref.pill, alertText(level));
   }
 }
-// Render live API data
+function renderSensorViews(data) {
+  const all = Array.isArray(data.sensors) ? data.sensors : [];
+  const filtered = all.filter(sensorPassesFilter);
+  setTextIfChanged($('sensorCount'), filtered.length + (filtered.length === 1 ? ' sensor' : ' sensors'));
+  if (currentView === 'card') renderSensorCards(filtered);
+  else renderSensorTable(filtered);
+}
 function render(data) {
   const cpu = num(data.cpuPowerWatts);
   const gpu = num(data.gpuPowerWatts);
   const total = num(data.totalPowerWatts);
   const dc = num(data.dcOutputWatts);
   const real = num(data.realPowerWatts);
-  const efficiency = num(data.psuEfficiencyPercent);
+  const eff = num(data.psuEfficiencyPercent);
   const ambient = num(data.ambientTempC);
   const pressure = num(data.pressureHpa);
-  $('cpuPower').textContent = fmt(cpu);
-  $('gpuPower').textContent = fmt(gpu);
-  $('totalPower').textContent = fmt(total);
-  $('dcOutput').textContent = fmt(dc);
-  $('realPower').textContent = fmt(real);
-  $('psuEfficiency').textContent = fmt(efficiency);
-  $('ambient').textContent = fmt(ambient);
-  $('pressure').textContent = fmt(pressure);
+  setTextIfChanged($('cpuPower'), fmt(cpu));
+  setTextIfChanged($('gpuPower'), fmt(gpu));
+  setTextIfChanged($('totalPower'), fmt(total));
+  setTextIfChanged($('dcOutput'), fmt(dc));
+  setTextIfChanged($('realPower'), fmt(real));
+  setTextIfChanged($('psuEfficiency'), fmt(eff));
+  setTextIfChanged($('ambient'), fmt(ambient));
+  setTextIfChanged($('pressure'), fmt(pressure));
   const cpuLevel = getLevel(cpu, 300, 400);
   const gpuLevel = getLevel(gpu, 300, 450);
   const totalLevel = getLevel(total, 600, 800);
   const dcLevel = getLevel(dc, 800, 900);
   const ambientLevel = getLevel(ambient, 45, 55);
-  updateCard('cardCpuPower', cpuLevel);
-  updateCard('cardGpuPower', gpuLevel);
-  updateCard('cardTotalPower', totalLevel);
-  updateCard('cardDcPower', dcLevel);
-  updateCard('cardRealPower', dcLevel);
-  updateCard('cardEfficiency', -1);
-  updateCard('cardAmbient', ambientLevel);
-  updateCard('cardPressure', -1);
+  updateCard('cardCpuPower', cpuLevel, 'pillCpuPower');
+  updateCard('cardGpuPower', gpuLevel, 'pillGpuPower');
+  updateCard('cardTotalPower', totalLevel, 'pillTotalPower');
+  updateCard('cardDcPower', dcLevel, 'pillDcPower');
+  updateCard('cardRealPower', dcLevel, 'pillRealPower');
+  updateCard('cardEfficiency', -1, 'pillEfficiency');
+  updateCard('cardAmbient', ambientLevel, 'pillAmbient');
+  updateCard('cardPressure', -1, 'pillPressure');
+  const sensors = Array.isArray(data.sensors) ? data.sensors : [];
+  const valCpuMax = findSensorVal(sensors, (t, d, n) =>
+    t === 'temperature' && isCpuDev(d) && n.includes('core max'));
+  const valCpuAvg = findSensorVal(sensors, (t, d, n) =>
+    t === 'temperature' && isCpuDev(d) && n.includes('core average'));
+  const valCpuPkg = findSensorVal(sensors, (t, d, n) =>
+    t === 'temperature' && isCpuDev(d) && (n === 'cpu package' || n === 'package' || n.includes('package')));
+  const valGpuCore = findSensorVal(sensors, (t, d, n) =>
+    t === 'temperature' && isGpuDev(d) && (n === 'gpu core' || n.includes('gpu core')));
+  const valGpuHot = findSensorVal(sensors, (t, d, n) =>
+    t === 'temperature' && isGpuDev(d) && (n.includes('hot spot') || n.includes('hotspot')));
+  const valGpuMem = findSensorVal(sensors, (t, d, n) =>
+    t === 'temperature' && isGpuDev(d) && (n.includes('memory junction') || n.includes('gpu memory') || n.includes('vram')));
+  const valCpuFan = findSensorVal(sensors, (t, d, n) =>
+    t === 'fan' && (n === 'cpu fan' || (isNuvotonDev(d) && n === 'fan #2')));
+  const valCaseFan = findSensorVal(sensors, (t, d, n) =>
+    t === 'fan' && (n === 'case fan' || (isNuvotonDev(d) && n === 'fan #3')));
+  const valGpuFan = findSensorVal(sensors, (t, d, n) =>
+    t === 'fan' && (isGpuDev(d) || n.includes('gpu fan')));
+  updatePinnedMetric('cardCpuCoreMax', 'cpuCoreMax', 'pillCpuCoreMax', valCpuMax, 75, 95);
+  updatePinnedMetric('cardCpuCoreAvg', 'cpuCoreAvg', 'pillCpuCoreAvg', valCpuAvg, 75, 95);
+  updatePinnedMetric('cardCpuPackage', 'cpuPackage', 'pillCpuPackage', valCpuPkg, 75, 95);
+  updatePinnedMetric('cardGpuCoreTemp', 'gpuCoreTemp', 'pillGpuCoreTemp', valGpuCore, 75, 95);
+  updatePinnedMetric('cardGpuHotspot', 'gpuHotspot', 'pillGpuHotspot', valGpuHot, 75, 95);
+  updatePinnedMetric('cardGpuMemJunction', 'gpuMemJunction', 'pillGpuMemJunction', valGpuMem, 75, 95);
+  updatePinnedMetric('cardCpuFan', 'cpuFan', 'pillCpuFan', valCpuFan, 2000, 2700);
+  updatePinnedMetric('cardCaseFan', 'caseFan', 'pillCaseFan', valCaseFan, 2000, 2700);
+  updatePinnedMetric('cardGpuFan', 'gpuFan', 'pillGpuFan', valGpuFan, 2000, 2700);
   showMetricCards();
   renderSensorViews(data);
-// Overall alert status.
-  let highest = Math.max(
-    cpuLevel,
-    gpuLevel,
-    totalLevel,
-    dcLevel,
-    ambientLevel
-  );
-  const sensors = Array.isArray(data.sensors)
-    ? data.sensors
-    : [];
-  for (const sensor of sensors) {
-    const level = getSensorLevel(sensor);
-    if (level > highest) {
-      highest = level;
-    }
+  let highest = Math.max(cpuLevel, gpuLevel, totalLevel, dcLevel, ambientLevel);
+  for (const s of sensors) {
+    const l = getSensorLevel(s);
+    if (l > highest) highest = l;
   }
-// Detect stale or missing PC telemetry.
   const age = num(data.lastPcDataAgeMs);
   const pcOffline = !Number.isFinite(age) || age > 5000;
   if (pcOffline) {
-    updateMainAlert(
-      -1,
-      'PC data is missing or stale. Check the PC monitoring application.'
-    );
+    updateMainAlert(-1, 'PC data is missing or stale. Check the PC monitoring application.');
   } else if (highest === 2) {
-    updateMainAlert(
-      2,
-      'At least one monitored value has reached its critical threshold.'
-    );
+    updateMainAlert(2, 'At least one monitored value has reached its critical threshold.');
   } else if (highest === 1) {
-    updateMainAlert(
-      1,
-      'At least one monitored value has reached its warning threshold.'
-    );
+    updateMainAlert(1, 'At least one monitored value has reached its warning threshold.');
   } else if (highest === 0) {
-    updateMainAlert(
-      0,
-      'All monitored values are within their configured thresholds.'
-    );
+    updateMainAlert(0, 'All monitored values are within their configured thresholds.');
   } else {
-    updateMainAlert(
-      -1,
-      'No valid sensor readings are currently available.'
-    );
+    updateMainAlert(-1, 'No valid sensor readings are currently available.');
   }
 }
-// Fetch ESP8266 API
 async function refresh() {
+  if (isRefreshing || document.hidden) return;
+  isRefreshing = true;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 2500);
   try {
-    const response = await fetch('/api', {
-      cache: 'no-store'
-    });
-    if (!response.ok) {
-      throw new Error('HTTP ' + response.status);
-    }
-    const data = await response.json();
+    const res = await fetch('/api', { cache: 'no-store', signal: ctrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
     current = data;
     render(data);
+    if (typeof data.lcdEnabled === 'boolean' && !lcdRequestPending) {
+      updateLcdButton(data.lcdEnabled);
+    }
     const age = num(data.lastPcDataAgeMs);
     const pcOnline = Number.isFinite(age) && age <= 5000;
-    setConnection(
-      pcOnline,
-      pcOnline ? 'PC DATA ONLINE' : 'PC DATA OFFLINE'
-    );
-    $('lastUpdate').textContent =
-      'Last update: ' + new Date().toLocaleTimeString();
-    $('status').textContent =
-      'MCU: ESP8266 | Wi-Fi channel: 8 | Refresh interval: 1 second | MAC: EC:FA:BC:8F:11:87 | Gateway: 192.168.1.1';
+    setConnection(pcOnline, pcOnline ? 'PC ONLINE' : 'PC OFFLINE');
+    setTextIfChanged($('deviceIpLabel'), data.deviceIp || location.hostname);
+    setTextIfChanged($('lastUpdate'), new Date().toLocaleTimeString());
+    setTextIfChanged($('status'),
+      `MCU: ESP8266 | Wi-Fi Channel: ${data.wifiChannel ?? '--'} | Interval: 1s | MAC: ${data.macAddress ?? '--'} | Gateway: ${data.gatewayIp ?? '--'}`);
   } catch (error) {
-    setConnection(false, 'ESP8266 DISCONNECTED');
-    $('status').textContent =
-      'Dashboard connection error: ' + error.message;
-    updateMainAlert(
-      -1,
-      'Cannot connect to the ESP8266. Check Wi-Fi and the device IP address.'
-    );
+    setConnection(false, 'MCU OFFLINE');
+    setTextIfChanged($('status'), 'Dashboard connection error: ' + (error.name === 'AbortError' ? 'Timeout' : error.message));
+    updateMainAlert(-1, 'Cannot connect to the ESP8266. Check Wi-Fi and the device IP address.');
+  } finally {
+    clearTimeout(timer);
+    isRefreshing = false;
   }
 }
- // LCD display control
-  let lcdIsEnabled = true;
-  let lcdRequestPending = false;
-  function updateLcdButton(enabled) {
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refresh();
+});
+// LCD Control
+let lcdIsEnabled = true;
+let lcdRequestPending = false;
+function updateLcdButton(enabled) {
   lcdIsEnabled = enabled;
   const button = $('btnLcdToggle');
-  const status = $('lcdStatusText');
-  button.textContent = enabled ? 'LCD: ON' : 'LCD: OFF';
+  setTextIfChanged(button, enabled ? 'LCD: ON' : 'LCD: OFF');
   button.classList.toggle('active', enabled);
   button.disabled = lcdRequestPending;
-  status.textContent = enabled
-    ? 'LCD Status: ON.'
-    : 'LCD Status: OFF.';
-}
-async function refreshLcdStatus() {
-  try {
-    const response = await fetch('/lcd/status', {
-      cache: 'no-store'
-    });
-    if (!response.ok) {
-      throw new Error('HTTP ' + response.status);
-    }
-    const data = await response.json();
-    updateLcdButton(data.lcdEnabled === true);
-  } catch (error) {
-    $('lcdStatusText').textContent =
-      'Can not read LCD status.';
-  }
 }
 $('btnLcdToggle').addEventListener('click', async () => {
   if (lcdRequestPending) return;
   lcdRequestPending = true;
-  $('btnLcdToggle').disabled = true;
+  const button = $('btnLcdToggle');
+  button.disabled = true;
   try {
-    const response = await fetch('/lcd/control', {
+    const res = await fetch('/lcd/control', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        enabled: !lcdIsEnabled
-      })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !lcdIsEnabled })
     });
-    if (!response.ok) {
-      throw new Error('HTTP ' + response.status);
-    }
-    const data = await response.json();
-    if (data.ok !== true) {
-      throw new Error('LCD command failed');
-    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (data.ok !== true) throw new Error('LCD command failed');
     updateLcdButton(data.lcdEnabled === true);
-  } catch (error) {
-    $('lcdStatusText').textContent =
-      'Control failed. Please try again.';
+  } catch {
+    button.textContent = '✕ FAILED';
+    setTimeout(() => updateLcdButton(lcdIsEnabled), 1500);
   } finally {
     lcdRequestPending = false;
-    $('btnLcdToggle').disabled = false;
+    button.disabled = false;
   }
 });
-// PC POWER BUTTON
+// PC Power Control
 let pcPowerRequestPending = false;
 $('btnPcPower').addEventListener('click', async () => {
-// Prevent repeated clicks while processing.
   if (pcPowerRequestPending) return;
   pcPowerRequestPending = true;
   const button = $('btnPcPower');
-  const status = $('pcPowerStatus');
   button.disabled = true;
+  button.textContent = 'SENDING...';
   try {
-    const response = await fetch('/pc/power', {
+    const res = await fetch('/pc/power', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        press: true
-      })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ press: true })
     });
-    const data = await response.json();
-    if (!response.ok || data.ok !== true) {
-      throw new Error(
-        data.error || ('HTTP ' + response.status)
-      );
-    }
-  } catch (error) {
-    status.textContent =
-      'Command failed: ' + error.message;
+    const data = await res.json();
+    if (!res.ok || data.ok !== true) throw new Error(data.error || ('HTTP ' + res.status));
+    button.textContent = '✓ SENT';
+  } catch {
+    button.textContent = '✕ FAILED';
   } finally {
-    pcPowerRequestPending = false;
-    button.disabled = false;
-    button.textContent = '⏻ PC POWER';
+    setTimeout(() => {
+      pcPowerRequestPending = false;
+      button.disabled = false;
+      button.textContent = 'PC POWER';
+    }, 1200);
   }
 });
-// Event handlers
-$('btnCardView').addEventListener('click', () => {
-  setView('card');
-});
-$('btnTableView').addEventListener('click', () => {
-  setView('table');
-});
-[
-  'optPower',
-  'optVoltage',
-  'optTemp',
-  'optFan',
-  'optEnv'
-].forEach(id => {
-  $(id).addEventListener('change', () => {
-    if (current) {
-      render(current);
-    } else {
-      showMetricCards();
-    }
+// View & Display Filters
+$('btnCardView').addEventListener('click', () => setView('card'));
+$('btnTableView').addEventListener('click', () => setView('table'));
+function getFiltersState() {
+  return {
+    power: $('optPower').checked,
+    voltage: $('optVoltage').checked,
+    temperature: $('optTemp').checked,
+    fan: $('optFan').checked,
+    env: $('optEnv').checked
+  };
+}
+function applyFiltersState(f) {
+  if (!f || typeof f !== 'object') return;
+  const map = {
+    optPower: f.power !== false,
+    optVoltage: f.voltage !== false,
+    optTemp: f.temperature !== false,
+    optFan: f.fan !== false,
+    optEnv: f.env !== false
+  };
+  Object.entries(map).forEach(([id, checked]) => {
+    const cb = $(id);
+    if (!cb) return;
+    cb.checked = checked;
+    const chip = cb.closest('.chip');
+    if (chip) chip.classList.toggle('checked', checked);
+  });
+}
+async function saveFiltersToMcu(f) {
+  try { localStorage.setItem('pcDashboardFilters', JSON.stringify(f)); } catch {}
+  try {
+    await fetch('/filters', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(f)
+    });
+  } catch {}
+}
+['optPower', 'optVoltage', 'optTemp', 'optFan', 'optEnv'].forEach(id => {
+  const cb = $(id);
+  const chip = cb.closest('.chip');
+  cb.addEventListener('change', () => {
+    if (chip) chip.classList.toggle('checked', cb.checked);
+    if (current) render(current);
+    else showMetricCards();
+    saveFiltersToMcu(getFiltersState());
   });
 });
- // THEME AND APPEARANCE SETTINGS
-const THEME_DEFAULTS = {
-  bg: '#0b1120',
-  panel: '#151f30',
-  text: '#e8eef8',
-  muted: '#93a4bb',
-  accent: '#60a5fa',
-  fontSize: '14px',
-  transparency: 55
-};
-const THEME_LIGHT = {
-  bg: '#f1f5f9',
-  panel: '#ffffff',
-  text: '#172033',
-  muted: '#64748b',
-  accent: '#2563eb',
-  fontSize: '14px',
-  transparency: 55
+// Appearance Modal (Opened via ⌘ Icon)
+function openAppearance() { $('appearanceModal').hidden = false; }
+function closeAppearance() { $('appearanceModal').hidden = true; }
+$('btnToggleAppearance').addEventListener('click', () => {
+  if ($('appearanceModal').hidden) openAppearance();
+  else closeAppearance();
+});
+$('btnCloseAppearance').addEventListener('click', closeAppearance);
+$('appearanceModal').addEventListener('click', e => {
+  if (e.target === $('appearanceModal')) closeAppearance();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('appearanceModal').hidden) closeAppearance();
+});
+// Theme Presets & Persistence
+const PRESETS = {
+  dark: {
+    mode: 'dark', bg: '#0b1120', panel: '#151f30',
+    text: '#e8eef8', muted: '#93a4bb', accent: '#60a5fa',
+    fontSize: '14px', transparency: 0
+  },
+  midnight: {
+    mode: 'midnight', bg: '#060913', panel: '#0f172a',
+    text: '#f1f5f9', muted: '#94a3b8', accent: '#38bdf8',
+    fontSize: '14px', transparency: 15
+  },
+  light: {
+    mode: 'light', bg: '#f1f5f9', panel: '#ffffff',
+    text: '#172033', muted: '#64748b', accent: '#2563eb',
+    fontSize: '14px', transparency: 0
+  }
 };
 function hexToRgba(hex, alpha) {
   const clean = hex.replace('#', '');
@@ -1754,197 +1688,216 @@ function hexToRgba(hex, alpha) {
   const b = parseInt(clean.substring(4, 6), 16);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
+function isLightHex(hex) {
+  const clean = hex.replace('#', '');
+  const r = parseInt(clean.substring(0, 2), 16);
+  const g = parseInt(clean.substring(2, 4), 16);
+  const b = parseInt(clean.substring(4, 6), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) > 145;
+}
+function syncSegmentedButtons(mode, fontSize) {
+  currentMode = mode;
+  currentFontSize = fontSize;
+  document.querySelectorAll('#themePresetGroup .seg-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  });
+  document.querySelectorAll('#fontSizeGroup .seg-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.size === fontSize);
+  });
+}
 function applyTheme(settings) {
   const root = document.documentElement;
-  const transparency = Math.min(
-  100,
-  Math.max(10, Number(settings.transparency ?? 55))
-);
-const opacity = 1 - transparency / 100;
-root.style.setProperty(
-  '--panel-glass',
-  hexToRgba(settings.panel, opacity)
-);
-  $('transparency').value = transparency;
-  $('transparencyValue').textContent =
-    transparency + '%';
+  const transparency = Math.min(100, Math.max(0, Number(settings.transparency ?? 0)));
+  const opacity = +(1 - transparency / 100).toFixed(2);
+  const mode = settings.mode || 'custom';
+  const fontSize = ['12px', '14px', '16px', '18px'].includes(settings.fontSize)
+    ? settings.fontSize : '14px';
+  syncSegmentedButtons(mode, fontSize);
   root.style.setProperty('--bg', settings.bg);
   root.style.setProperty('--panel', settings.panel);
+  root.style.setProperty('--panel-glass', hexToRgba(settings.panel, opacity));
   root.style.setProperty('--text', settings.text);
   root.style.setProperty('--muted', settings.muted);
   root.style.setProperty('--accent', settings.accent);
-  document.documentElement.style.setProperty(
-  '--dashboard-font-size',
-  settings.fontSize
-);
-// Keep form controls synchronized with the current theme.
+  root.style.setProperty('--dashboard-font-size', fontSize);
   $('bgColor').value = settings.bg;
+  $('bgColorHex').textContent = settings.bg;
   $('panelColor').value = settings.panel;
+  $('panelColorHex').textContent = settings.panel;
   $('textColor').value = settings.text;
+  $('textColorHex').textContent = settings.text;
   $('mutedColor').value = settings.muted;
+  $('mutedColorHex').textContent = settings.muted;
   $('accentColor').value = settings.accent;
-  $('fontSize').value = settings.fontSize;
-// Update secondary colors for better contrast.
-  if ($('themeMode').value === 'light') {
+  $('accentColorHex').textContent = settings.accent;
+  $('transparency').value = transparency;
+  $('transparencyValue').textContent = transparency + '%';
+  const lightBg = mode === 'light' || isLightHex(settings.bg);
+  if (lightBg) {
+    root.style.setProperty('color-scheme', 'light');
     root.style.setProperty('--bg-glow', '#dbeafe');
     root.style.setProperty('--border', '#cbd5e1');
-    root.style.setProperty('--button-bg', '#e2e8f0');
+    root.style.setProperty('--button-bg', `rgba(226, 232, 240, ${Math.max(0.25, opacity)})`);
     root.style.setProperty('--button-hover', '#cbd5e1');
+    root.style.setProperty('--button-active-bg', `rgba(220, 252, 231, ${Math.max(0.35, opacity)})`);
+    root.style.setProperty('--button-active-border', '#22c55e');
     root.style.setProperty('--table-header', '#e2e8f0');
     root.style.setProperty('--table-border', '#cbd5e1');
     root.style.setProperty('--text-secondary', '#334155');
+    root.style.setProperty('--status-green-bg', `rgba(220, 252, 231, ${opacity})`);
+    root.style.setProperty('--status-yellow-bg', `rgba(254, 249, 195, ${opacity})`);
+    root.style.setProperty('--status-red-bg', `rgba(255, 228, 230, ${opacity})`);
   } else {
+    root.style.setProperty('color-scheme', 'dark');
     root.style.setProperty('--bg-glow', '#152137');
     root.style.setProperty('--border', '#29374c');
-    root.style.setProperty('--button-bg', '#111a29');
-    root.style.setProperty('--button-hover', '#202d40');
-    root.style.setProperty('--table-header', '#202b3d');
+    root.style.setProperty('--button-bg', `rgba(17, 26, 41, ${Math.max(0.2, opacity * 0.85)})`);
+    root.style.setProperty('--button-hover', 'rgba(32, 45, 64, 0.9)');
+    root.style.setProperty('--button-active-bg', `rgba(16, 48, 35, ${Math.max(0.25, opacity)})`);
+    root.style.setProperty('--button-active-border', '#28664b');
+    root.style.setProperty('--table-header', '#1a2639');
     root.style.setProperty('--table-border', '#293548');
     root.style.setProperty('--text-secondary', '#b9c8dc');
+    root.style.setProperty('--status-green-bg', `rgba(16, 41, 30, ${opacity})`);
+    root.style.setProperty('--status-yellow-bg', `rgba(48, 39, 14, ${opacity})`);
+    root.style.setProperty('--status-red-bg', `rgba(53, 23, 23, ${opacity})`);
   }
 }
 function getThemeSettings() {
   return {
+    mode: currentMode,
     bg: $('bgColor').value,
     panel: $('panelColor').value,
     text: $('textColor').value,
     muted: $('mutedColor').value,
     accent: $('accentColor').value,
-    fontSize: $('fontSize').value,
+    fontSize: currentFontSize,
     transparency: Number($('transparency').value)
   };
 }
-function showThemeMessage(message) {
-  $('themeMessage').textContent = message;
+function sanitizeSettings(s) {
+  const validHex = v => typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v);
+  const validSizes = ['12px', '14px', '16px', '18px'];
+  return {
+    mode: ['dark', 'midnight', 'light', 'custom'].includes(s.mode) ? s.mode : 'custom',
+    bg: validHex(s.bg) ? s.bg : PRESETS.dark.bg,
+    panel: validHex(s.panel) ? s.panel : PRESETS.dark.panel,
+    text: validHex(s.text) ? s.text : PRESETS.dark.text,
+    muted: validHex(s.muted) ? s.muted : PRESETS.dark.muted,
+    accent: validHex(s.accent) ? s.accent : PRESETS.dark.accent,
+    fontSize: validSizes.includes(s.fontSize) ? s.fontSize : '14px',
+    transparency: Number.isFinite(Number(s.transparency))
+      ? Math.min(100, Math.max(0, Number(s.transparency))) : 0
+  };
 }
-// Apply selected theme.
-function selectTheme() {
-  const mode = $('themeMode').value;
-  if (mode === 'light') {
-    applyTheme(THEME_LIGHT);
-  } else if (mode === 'dark') {
-    applyTheme(THEME_DEFAULTS);
-  } else {
-    applyTheme(getThemeSettings());
-  }
-  showThemeMessage('Theme preview updated.');
+async function saveSettingsToMcu(settings) {
+  try { localStorage.setItem('pcDashboardTheme', JSON.stringify(settings)); } catch {}
+  const res = await fetch('/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  if (data.ok !== true) throw new Error('Save failed');
 }
-// Apply changes immediately when selecting colors or font size.
-[
-  'bgColor',
-  'panelColor',
-  'textColor',
-  'mutedColor',
-  'accentColor',
-  'fontSize',
-  'transparency'
-].forEach(id => {
-  $(id).addEventListener('input', () => {
-    $('themeMode').value = 'custom';
-    if (id === 'transparency') {
-      $('transparencyValue').textContent =
-        $('transparency').value + '%';
+document.querySelectorAll('#themePresetGroup .seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const mode = btn.dataset.mode;
+    if (PRESETS[mode]) {
+      applyTheme({ ...PRESETS[mode], fontSize: currentFontSize });
+    } else {
+      currentMode = 'custom';
+      applyTheme(getThemeSettings());
     }
-    applyTheme(getThemeSettings());
-    showThemeMessage(
-      'Unsaved changes. Click Save Settings.'
-    );
+    $('themeMessage').textContent = 'Preview updated — click Save to MCU.';
   });
 });
-$('themeMode').addEventListener('change', selectTheme);
-// SAVE SETTINGS BUTTON.
-$('saveTheme').addEventListener('click', () => {
+document.querySelectorAll('#fontSizeGroup .seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentFontSize = btn.dataset.size;
+    applyTheme(getThemeSettings());
+    $('themeMessage').textContent = 'Unsaved changes.';
+  });
+});
+['bgColor', 'panelColor', 'textColor', 'mutedColor', 'accentColor', 'transparency'].forEach(id => {
+  $(id).addEventListener('input', () => {
+    if (id !== 'transparency') currentMode = 'custom';
+    applyTheme(getThemeSettings());
+    $('themeMessage').textContent = 'Unsaved changes.';
+  });
+});
+$('saveTheme').addEventListener('click', async () => {
+  const btn = $('saveTheme');
+  btn.disabled = true;
+  $('themeMessage').textContent = 'Saving to ESP8266...';
   try {
-    const settings = getThemeSettings();
-    localStorage.setItem(
-      'pcDashboardTheme',
-      JSON.stringify(settings)
-    );
-    applyTheme(settings);
-    showThemeMessage('Settings saved successfully.');
-  } catch (error) {
-    showThemeMessage(
-      'Cannot save settings in this browser.'
-    );
-    console.error('Theme save error:', error);
+    await saveSettingsToMcu(getThemeSettings());
+    $('themeMessage').textContent = 'Saved to MCU EEPROM!';
+  } catch (err) {
+    $('themeMessage').textContent = 'Save failed: ' + err.message;
+  } finally {
+    btn.disabled = false;
   }
 });
-// RESET THEME BUTTON.
-$('resetTheme').addEventListener('click', () => {
+$('resetTheme').addEventListener('click', async () => {
+  const btn = $('resetTheme');
+  btn.disabled = true;
+  const def = { ...PRESETS.dark };
+  applyTheme(def);
   try {
-    localStorage.removeItem('pcDashboardTheme');
-  } catch (error) {
-    console.error('Theme reset error:', error);
+    await saveSettingsToMcu(def);
+    $('themeMessage').textContent = 'Reset & saved to MCU.';
+  } catch {
+    $('themeMessage').textContent = 'Reset locally (MCU offline).';
+  } finally {
+    btn.disabled = false;
   }
-  $('themeMode').value = 'dark';
-  applyTheme(THEME_DEFAULTS);
-  showThemeMessage('Theme has been reset to default.');
 });
-// LOAD SAVED SETTINGS WHEN THE DASHBOARD OPENS.
-(function loadSavedTheme() {
+(function loadCachedState() {
   try {
-    const saved = localStorage.getItem('pcDashboardTheme');
-    if (saved) {
-      const settings = JSON.parse(saved);
-      const validColor = value =>
-        typeof value === 'string' &&
-        /^#[0-9a-fA-F]{6}$/.test(value);
-      const validFontSizes = [
-        '12px', '14px', '16px', '18px'
-      ];
-      const settingsToApply = {
-        bg: validColor(settings.bg)
-          ? settings.bg : THEME_DEFAULTS.bg,
-        panel: validColor(settings.panel)
-          ? settings.panel : THEME_DEFAULTS.panel,
-        text: validColor(settings.text)
-          ? settings.text : THEME_DEFAULTS.text,
-        muted: validColor(settings.muted)
-          ? settings.muted : THEME_DEFAULTS.muted,
-        accent: validColor(settings.accent)
-          ? settings.accent : THEME_DEFAULTS.accent,
-        fontSize: validFontSizes.includes(settings.fontSize)
-          ? settings.fontSize : THEME_DEFAULTS.fontSize,
-        transparency: Number.isFinite(Number(settings.transparency))
-          ? Math.min(100, Math.max(10, Number(settings.transparency)))
-          : THEME_DEFAULTS.transparency
-      };
-      $('themeMode').value = 'custom';
-      applyTheme(settingsToApply);
-    } else {
-      $('themeMode').value = 'dark';
-      applyTheme(THEME_DEFAULTS);
-    }
-  } catch (error) {
-    console.error('Theme load error:', error);
-    $('themeMode').value = 'dark';
-    applyTheme(THEME_DEFAULTS);
-    showThemeMessage('Using default theme.');
+    const savedTheme = localStorage.getItem('pcDashboardTheme');
+    applyTheme(savedTheme ? sanitizeSettings(JSON.parse(savedTheme)) : PRESETS.dark);
+  } catch {
+    applyTheme(PRESETS.dark);
   }
+  try {
+    const savedFilters = localStorage.getItem('pcDashboardFilters');
+    if (savedFilters) applyFiltersState(JSON.parse(savedFilters));
+  } catch {}
 })();
-//  Start dashboard
+async function loadSettingsFromMcu() {
+  try {
+    const res = await fetch('/settings', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    const s = sanitizeSettings(data);
+    applyTheme(s);
+    try { localStorage.setItem('pcDashboardTheme', JSON.stringify(s)); } catch {}
+    if (typeof data.lcdEnabled === 'boolean') {
+      updateLcdButton(data.lcdEnabled);
+    }
+    if (data.filters) {
+      applyFiltersState(data.filters);
+      try { localStorage.setItem('pcDashboardFilters', JSON.stringify(data.filters)); } catch {}
+      if (current) render(current);
+      else showMetricCards();
+    }
+  } catch {}
+}
+// Start Dashboard
 setView('card');
 showMetricCards();
+loadSettingsFromMcu();
 refresh();
-refreshLcdStatus();
 setInterval(refresh, 1000);
-setInterval(refreshLcdStatus, 5000);
 </script>
-</main>
 </body>
 </html>
 )HTML";
 // ESP-NOW RECEIVE CALLBACK
-void onEspNowReceive(
-    uint8_t *mac,
-    uint8_t *data,
-    uint8_t len
-) {
-// Accept only the expected one-byte command.
-  if (len != 1 || data[0] != 1) {
-    return;
-  }
-// Queue the command if capacity is available.
+void onEspNowReceive(uint8_t *mac, uint8_t *data, uint8_t len) {
+  if (len != 1 || data[0] != 1) return;
   if (pendingCommands < MAX_PENDING_COMMANDS) {
     pendingCommands++;
   }
@@ -1960,14 +1913,11 @@ bool initEspNow() {
     Serial.println(ESPNOW_CHANNEL);
     return false;
   }
-// Initialize ESP-NOW while keeping router Wi-Fi active.
   if (esp_now_init() != 0) {
     Serial.println(F("ESP-NOW initialization failed"));
     return false;
   }
-// Configure the receiver role.
   esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
-// Register the receive callback.
   if (esp_now_register_recv_cb(onEspNowReceive) != 0) {
     Serial.println(F("ESP-NOW callback registration failed"));
     esp_now_deinit();
@@ -1980,14 +1930,11 @@ bool initEspNow() {
 }
 // OPTOCOUPLER CONTROL
 void processOptoCommands() {
-  // Release the output when the pulse expires.
-  if (pulseActive &&
-      millis() - pulseStart >= PULSE_MS) {
+  if (pulseActive && millis() - pulseStart >= PULSE_MS) {
     digitalWrite(OPTO_PIN, HIGH);
     pulseActive = false;
     Serial.println(F("PWR_SW released"));
   }
-// Process the next command after the current pulse ends.
   if (!pulseActive && pendingCommands > 0) {
     noInterrupts();
     if (pendingCommands > 0) {
@@ -2000,123 +1947,174 @@ void processOptoCommands() {
     Serial.println(F("PWR_SW pressed"));
   }
 }
-// RECEIVE PC DATA
+// RECEIVE PC DATA (Zero String allocation inside sensor loop)
 void handleData() {
   if (!server.hasArg("plain")) {
-    server.send(
-      400,
-      "application/json",
-      "{\"ok\":false,\"error\":\"Missing request body\"}"
-    );
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing request body\"}");
     return;
   }
-  DynamicJsonDocument doc(8192);
-  DeserializationError err =
-      deserializeJson(doc, server.arg("plain"));
-  if (err ||
-      !doc.is<JsonObject>() ||
-      !doc["sensors"].is<JsonArray>()) {
-    server.send(
-      400,
-      "application/json",
-      "{\"ok\":false,\"error\":\"Invalid JSON\"}"
-    );
+  DynamicJsonDocument doc(10240);
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err || !doc.is<JsonObject>() || !doc["sensors"].is<JsonArray>()) {
+    Serial.printf("JSON parse error: %s\n", err ? err.c_str() : "Missing sensors array");
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
     return;
   }
-// Keep only Fan #2 and Fan #3 from Nuvoton.
   JsonArray sensors = doc["sensors"].as<JsonArray>();
   for (int i = (int)sensors.size() - 1; i >= 0; --i) {
     JsonObject sensor = sensors[i];
-    String device = sensor["device"] | "";
-    String name = sensor["name"] | "";
-    String type = sensor["type"] | "";
-    device.toLowerCase();
-    bool isNuvoton =
-        device.indexOf("nuvoton") >= 0 ||
-        device.indexOf("nct6798d") >= 0;
-    if (isNuvoton &&
-        !(type == "Fan" &&
-          (name == "Fan #2" || name == "Fan #3"))) {
-      sensors.remove(i);
+    const char* device = sensor["device"] | "";
+    const char* name = sensor["name"] | "";
+    const char* type = sensor["type"] | "";
+    if (strContainsCI(device, "nuvoton") || strContainsCI(device, "nct6798d")) {
+      if (strcmp(type, "Fan") == 0 && strcmp(name, "Fan #2") == 0) {
+        sensor["name"] = "CPU Fan";
+      } else if (strcmp(type, "Fan") == 0 && strcmp(name, "Fan #3") == 0) {
+        sensor["name"] = "Case Fan";
+      } else {
+        sensors.remove(i);
+      }
     }
   }
-  // Calculate combined CPU and GPU power.
-  float cpu = doc["cpuPowerWatts"] | NAN;
-  float gpu = doc["gpuPowerWatts"] | NAN;
-  if (isfinite(cpu) &&
-      isfinite(gpu) &&
-      cpu >= 0 &&
-      gpu >= 0) {
-    doc["totalPowerWatts"] = cpu + gpu;
-  } else {
-    doc["totalPowerWatts"] = nullptr;
-  }
-// Estimate PSU output and input power.
   calculateRealPower(doc);
-// Store the latest PC data.
+  size_t needed = measureJson(doc) + 1;
   latestJson = "";
+  latestJson.reserve(needed);
   serializeJson(doc, latestJson);
   lastPcData = millis();
-  Serial.printf(
-    "PC data received: %u bytes, %u sensors\n",
-    (unsigned)latestJson.length(),
-    (unsigned)sensors.size()
-  );
-  if (isfinite(realPowerWatts)) {
-    Serial.printf(
-      "DC: %.1f W | AC EST: %.1f W | Efficiency: %.2f%%\n",
-      dcOutputWatts,
-      realPowerWatts,
-      psuEfficiency
-    );
-  }
-  server.send(
-    200,
-    "application/json",
-    "{\"ok\":true}"
-  );
+  Serial.printf("PC data: %u bytes | %u sensors | Heap: %u\n",
+                (unsigned)latestJson.length(),
+                (unsigned)sensors.size(),
+                (unsigned)ESP.getFreeHeap());
+
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 // WEB API
 void handleApi() {
-  DynamicJsonDocument doc(8192);
-  DeserializationError err =
-      deserializeJson(doc, latestJson);
-  if (err) {
-    server.send(
-      500,
-      "application/json",
-      "{\"error\":\"Invalid stored JSON\"}"
-    );
+  if (latestJson.length() < 2 || !latestJson.endsWith("}")) {
+    server.send(500, "application/json", "{\"error\":\"Invalid stored JSON\"}");
     return;
   }
-// Add BMP280 temperature.
-  if (isfinite(ambientTemp)) {
-    doc["ambientTempC"] = ambientTemp;
-  } else {
-    doc["ambientTempC"] = nullptr;
-  }
-// Add BMP280 pressure.
-  if (isfinite(pressureHpa)) {
-    doc["pressureHpa"] = pressureHpa;
-  } else {
-    doc["pressureHpa"] = nullptr;
-  }
-// Add the age of the latest PC data packet.
-  if (lastPcData == 0) {
-    doc["lastPcDataAgeMs"] = nullptr;
-  } else {
-    doc["lastPcDataAgeMs"] =
-        (unsigned long)(millis() - lastPcData);
-  }
+  String output;
+  output.reserve(latestJson.length() + 240);
+  output = latestJson.substring(0, latestJson.length() - 1);
+  output += F(",\"ambientTempC\":");
+  output += isfinite(ambientTemp) ? String(ambientTemp, 2) : F("null");
+  output += F(",\"pressureHpa\":");
+  output += isfinite(pressureHpa) ? String(pressureHpa, 2) : F("null");
+  output += F(",\"lastPcDataAgeMs\":");
+  output += (lastPcData == 0) ? String(F("null")) : String((unsigned long)(millis() - lastPcData));
+  output += F(",\"lcdEnabled\":");
+  output += lcdEnabled ? F("true") : F("false");
+  output += F(",\"deviceIp\":\"");
+  output += WiFi.localIP().toString();
+  output += F("\",\"wifiChannel\":");
+  output += String(WiFi.channel());
+  output += F(",\"macAddress\":\"");
+  output += macStr;
+  output += F("\",\"gatewayIp\":\"");
+  output += WiFi.gatewayIP().toString();
+  output += F("\"}");
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", output);
+}
+// SETTINGS API
+void handleGetSettings() {
+  StaticJsonDocument<512> doc;
+  doc["lcdEnabled"] = lcdEnabled;
+  doc["mode"] = appSettings.themeMode;
+  doc["bg"] = appSettings.bg;
+  doc["panel"] = appSettings.panel;
+  doc["text"] = appSettings.text;
+  doc["muted"] = appSettings.muted;
+  doc["accent"] = appSettings.accent;
+  doc["fontSize"] = String(appSettings.fontSize) + "px";
+  doc["transparency"] = appSettings.transparency;
+  JsonObject filters = doc.createNestedObject("filters");
+  filters["power"] = (appSettings.filterMask & (1 << 0)) != 0;
+  filters["voltage"] = (appSettings.filterMask & (1 << 1)) != 0;
+  filters["temperature"] = (appSettings.filterMask & (1 << 2)) != 0;
+  filters["fan"] = (appSettings.filterMask & (1 << 3)) != 0;
+  filters["env"] = (appSettings.filterMask & (1 << 4)) != 0;
   String output;
   serializeJson(doc, output);
   server.sendHeader("Cache-Control", "no-store");
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(
-    200,
-    "application/json",
-    output
-  );
+  server.send(200, "application/json", output);
+}
+void handleSaveSettings() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing JSON body\"}");
+    return;
+  }
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err || !doc.is<JsonObject>()) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    return;
+  }
+  const char* mode = doc["mode"] | "";
+  const char* bg = doc["bg"] | "";
+  const char* panel = doc["panel"] | "";
+  const char* text = doc["text"] | "";
+  const char* muted = doc["muted"] | "";
+  const char* accent = doc["accent"] | "";
+  if (!isValidHexColor(bg) || !isValidHexColor(panel) ||
+      !isValidHexColor(text) || !isValidHexColor(muted) ||
+      !isValidHexColor(accent)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid hex color\"}");
+    return;
+  }
+  int t = doc["transparency"] | 0;
+  if (t < 0) t = 0;
+  if (t > 100) t = 100;
+  uint8_t fs = 14;
+  if (doc["fontSize"].is<int>()) {
+    fs = (uint8_t)doc["fontSize"].as<int>();
+  } else if (doc["fontSize"].is<const char*>()) {
+    fs = (uint8_t)atoi(doc["fontSize"].as<const char*>());
+  }
+  if (fs != 12 && fs != 14 && fs != 16 && fs != 18) fs = 14;
+
+  if (strlen(mode) > 0) {
+    strlcpy(appSettings.themeMode, mode, sizeof(appSettings.themeMode));
+  } else {
+    strlcpy(appSettings.themeMode, "custom", sizeof(appSettings.themeMode));
+  }
+  strlcpy(appSettings.bg, bg, sizeof(appSettings.bg));
+  strlcpy(appSettings.panel, panel, sizeof(appSettings.panel));
+  strlcpy(appSettings.text, text, sizeof(appSettings.text));
+  strlcpy(appSettings.muted, muted, sizeof(appSettings.muted));
+  strlcpy(appSettings.accent, accent, sizeof(appSettings.accent));
+  appSettings.fontSize = fs;
+  appSettings.transparency = (uint8_t)t;
+  saveSettings();
+  Serial.println(F("Appearance settings saved to EEPROM"));
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+void handleSaveFilters() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing JSON body\"}");
+    return;
+  }
+  StaticJsonDocument<192> doc;
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err || !doc.is<JsonObject>()) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    return;
+  }
+  uint8_t mask = 0;
+  if (doc["power"] | true)       mask |= (1 << 0);
+  if (doc["voltage"] | true)     mask |= (1 << 1);
+  if (doc["temperature"] | true) mask |= (1 << 2);
+  if (doc["fan"] | true)         mask |= (1 << 3);
+  if (doc["env"] | true)         mask |= (1 << 4);
+  appSettings.filterMask = mask;
+  saveSettings();
+  Serial.printf("Display filters saved to EEPROM (mask=0x%02X)\n", mask);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 // LCD WEB CONTROL
 void handleLcdStatus() {
@@ -2124,83 +2122,46 @@ void handleLcdStatus() {
   json += lcdEnabled ? "true" : "false";
   json += "}";
   server.sendHeader("Cache-Control", "no-store");
-  server.send(
-    200,
-    "application/json",
-    json
-  );
+  server.send(200, "application/json", json);
 }
 void handleLcdControl() {
   if (!server.hasArg("plain")) {
-    server.send(
-      400,
-      "application/json",
-      "{\"ok\":false,\"error\":\"Missing JSON body\"}"
-    );
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing JSON body\"}");
     return;
   }
   StaticJsonDocument<64> doc;
-  DeserializationError err =
-      deserializeJson(doc, server.arg("plain"));
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
   if (err || !doc["enabled"].is<bool>()) {
-    server.send(
-      400,
-      "application/json",
-      "{\"ok\":false,\"error\":\"Invalid enabled value\"}"
-    );
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid enabled value\"}");
     return;
   }
-  bool newState = doc["enabled"].as<bool>();
-  lcdEnabled = newState;
+  lcdEnabled = doc["enabled"].as<bool>();
   if (lcdEnabled) {
-// Turn on the backlight and refresh the current page.
     lcd.backlight();
     showLcdPage();
   } else {
-// Turn off only the backlight.
-// LCD page updates continue in loop().
     lcd.noBacklight();
   }
+  saveSettings();
   String json = "{\"ok\":true,\"lcdEnabled\":";
   json += lcdEnabled ? "true" : "false";
   json += "}";
   server.sendHeader("Cache-Control", "no-store");
-  server.send(
-    200,
-    "application/json",
-    json
-  );
-  Serial.printf(
-    "LCD backlight: %s\n",
-    lcdEnabled ? "ON" : "OFF"
-  );
+  server.send(200, "application/json", json);
+  Serial.printf("LCD backlight saved to EEPROM: %s\n", lcdEnabled ? "ON" : "OFF");
 }
-// PC POWER DASHBROAD CONTROL
+// PC POWER DASHBOARD CONTROL
 void handlePcPowerControl() {
-// Check whether the request has a body.
   if (!server.hasArg("plain")) {
-    server.send(
-      400,
-      "application/json",
-      "{\"ok\":false,\"error\":\"Missing JSON body\"}"
-    );
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing JSON body\"}");
     return;
   }
-// Parse the JSON request.
   StaticJsonDocument<64> doc;
-  DeserializationError err =
-      deserializeJson(doc, server.arg("plain"));
-  if (err ||
-      !doc["press"].is<bool>() ||
-      doc["press"].as<bool>() != true) {
-    server.send(
-      400,
-      "application/json",
-      "{\"ok\":false,\"error\":\"Invalid command\"}"
-    );
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err || !doc["press"].is<bool>() || doc["press"].as<bool>() != true) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid command\"}");
     return;
   }
-// Add a command to the existing queue.
   bool queued = false;
   noInterrupts();
   if (pendingCommands < MAX_PENDING_COMMANDS) {
@@ -2208,96 +2169,54 @@ void handlePcPowerControl() {
     queued = true;
   }
   interrupts();
-// Reject the request if the queue is full.
   if (!queued) {
-    server.send(
-      429,
-      "application/json",
-      "{\"ok\":false,\"error\":\"Command queue full\"}"
-    );
+    server.send(429, "application/json", "{\"ok\":false,\"error\":\"Command queue full\"}");
     return;
   }
-// Acknowledge that the command has been queued.
   server.sendHeader("Cache-Control", "no-store");
-  server.send(
-    202,
-    "application/json",
-    "{\"ok\":true,\"queued\":true,\"pulseMs\":600}"
-  );
+  server.send(202, "application/json", "{\"ok\":true,\"queued\":true,\"pulseMs\":600}");
   Serial.println(F("PC power command queued"));
 }
 // BMP280
 void readBmp() {
-  if (!bmpAvailable ||
-      millis() - lastBmpRead < 1000) {
-    return;
-  }
+  if (!bmpAvailable || millis() - lastBmpRead < 1000) return;
   lastBmpRead = millis();
   float temperature = bmp.readTemperature();
   float pressure = bmp.readPressure() / 100.0F;
-  if (isfinite(temperature) &&
-      isfinite(pressure) &&
-      pressure > 0) {
+  if (isfinite(temperature) && isfinite(pressure) && pressure > 0) {
     ambientTemp = temperature;
     pressureHpa = pressure;
   }
 }
 // LCD DISPLAY
 void showLcdPage() {
-  DynamicJsonDocument doc(8192);
-  DeserializationError err =
-      deserializeJson(doc, latestJson);
-  float cpuPower = NAN;
-  float gpuPower = NAN;
-  float totalPower = NAN;
-  float realPower = NAN;
-  if (!err) {
-    cpuPower = doc["cpuPowerWatts"] | NAN;
-    gpuPower = doc["gpuPowerWatts"] | NAN;
-    totalPower = doc["totalPowerWatts"] | NAN;
-    realPower = doc["realPowerWatts"] | NAN;
-  }
   String line1;
   String line2;
   switch (lcdPage) {
     case 0:
       line1 = "CPU Power";
-      line2 = isfinite(cpuPower)
-          ? String(cpuPower, 1) + " W"
-          : "Waiting for PC";
+      line2 = isfinite(cpuPowerWatts) ? String(cpuPowerWatts, 1) + " W" : "Waiting for PC";
       break;
     case 1:
       line1 = "GPU Power";
-      line2 = isfinite(gpuPower)
-          ? String(gpuPower, 1) + " W"
-          : "Waiting for PC";
+      line2 = isfinite(gpuPowerWatts) ? String(gpuPowerWatts, 1) + " W" : "Waiting for PC";
       break;
     case 2:
       line1 = "CPU + GPU Total";
-      line2 = isfinite(totalPower)
-          ? String(totalPower, 1) + " W"
-          : "Waiting for PC";
+      line2 = isfinite(totalPowerWatts) ? String(totalPowerWatts, 1) + " W" : "Waiting for PC";
       break;
     case 3:
       line1 = "Real Power AC";
-      line2 = isfinite(realPower)
-          ? String(realPower, 1) + " W EST"
-          : "Waiting for PC";
+      line2 = isfinite(realPowerWatts) ? String(realPowerWatts, 1) + " W EST" : "Waiting for PC";
       break;
     case 4:
-      line1 = isfinite(ambientTemp)
-          ? "Temp: " + String(ambientTemp, 1) + " C"
-          : "Temp: --.- C";
-      line2 = isfinite(pressureHpa)
-          ? "Pres: " + String(pressureHpa, 1) + " hPa"
-          : "Pres: ---- hPa";
+      line1 = isfinite(ambientTemp) ? "Temp: " + String(ambientTemp, 1) + " C" : "Temp: --.- C";
+      line2 = isfinite(pressureHpa) ? "Pres: " + String(pressureHpa, 1) + " hPa" : "Pres: ---- hPa";
       break;
     default:
       lcdPage = 0;
       line1 = "CPU Power";
-      line2 = isfinite(cpuPower)
-          ? String(cpuPower, 1) + " W"
-          : "Waiting for PC";
+      line2 = isfinite(cpuPowerWatts) ? String(cpuPowerWatts, 1) + " W" : "Waiting for PC";
       break;
   }
   lcdLine(0, line1);
@@ -2307,21 +2226,16 @@ void showLcdPage() {
 bool connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.setAutoReconnect(true);
-// Configure the static IP before connecting.
-  if (!WiFi.config(
-        local_IP,
-        gateway,
-        subnet,
-        primaryDNS)) {
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
     Serial.println(F("Static IP configuration failed"));
     return false;
   }
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print(F("Connecting to Wi-Fi"));
   unsigned long startTime = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - startTime < 30000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
     delay(300);
     Serial.print('.');
   }
@@ -2330,6 +2244,7 @@ bool connectWiFi() {
     Serial.println(F("Wi-Fi connection failed"));
     return false;
   }
+  strlcpy(macStr, WiFi.macAddress().c_str(), sizeof(macStr));
   Serial.println(F("Wi-Fi connected"));
   Serial.print(F("ESP8266 IP: "));
   Serial.println(WiFi.localIP());
@@ -2345,124 +2260,76 @@ void setup() {
   delay(100);
   Serial.println();
   Serial.println(F("PC Monitor - ESP8266"));
-// Initialize the optocoupler output in the released state.
+  loadSettings();
   digitalWrite(OPTO_PIN, HIGH);
   pinMode(OPTO_PIN, OUTPUT);
-// Initialize I2C.
   Wire.begin(SDA_PIN, SCL_PIN);
-// Initialize LCD.
   lcd.init();
-  lcd.backlight();
+  if (lcdEnabled) {
+    lcd.backlight();
+  } else {
+    lcd.noBacklight();
+  }
   lcdLine(0, "PC Monitor");
   lcdLine(1, "Starting...");
-// Initialize BMP280.
   bmpAvailable = bmp.begin(0x76);
   if (!bmpAvailable) {
     bmpAvailable = bmp.begin(0x77);
   }
-  Serial.printf(
-    "BMP280 status: %s\n",
-    bmpAvailable ? "FOUND" : "NOT FOUND"
-  );
-// Connect to Wi-Fi.
+  Serial.printf("BMP280 status: %s\n", bmpAvailable ? "FOUND" : "NOT FOUND");
   lcdLine(0, "Connecting WiFi");
   lcdLine(1, "Please wait");
   if (!connectWiFi()) {
     lcdLine(0, "WiFi Failed");
     lcdLine(1, "Check Settings");
-    Serial.println(
-      F("Check SSID, password, static IP and subnet.")
-    );
+    Serial.println(F("Check SSID, password, static IP and subnet."));
     while (true) {
       delay(1000);
     }
   }
-// Initialize ESP-NOW after Wi-Fi connects.
   espNowAvailable = initEspNow();
   if (!espNowAvailable) {
-    Serial.println(
-      F("Warning: ESP-NOW remote control is unavailable")
-    );
+    Serial.println(F("Warning: ESP-NOW remote control is unavailable"));
   }
   lcdLine(0, "WiFi Connected");
   lcdLine(1, WiFi.localIP().toString());
   delay(1500);
-// Register the dashboard.
   server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+  });
+  server.on("/favicon.svg", HTTP_GET, []() {
     server.send_P(
       200,
-      "text/html; charset=utf-8",
-      INDEX_HTML
+      "image/svg+xml",
+      R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="12" fill="#0b1120"/>
+<text x="32" y="46" font-family="Arial,sans-serif" font-size="44" text-anchor="middle" fill="#4ade80">&#8984;</text>
+</svg>)SVG"
     );
   });
-// Register API endpoints.
-server.on("/api", HTTP_GET, handleApi);
-server.on("/data", HTTP_POST, handleData);
-// PC power control.
-server.on(
-  "/pc/power",
-  HTTP_POST,
-  handlePcPowerControl
-);
-// LCD display control.
-server.on("/lcd/status", HTTP_GET, handleLcdStatus);
-server.on("/lcd/control", HTTP_POST, handleLcdControl);
+  server.on("/api", HTTP_GET, handleApi);
+  server.on("/data", HTTP_POST, handleData);
+  server.on("/settings", HTTP_GET, handleGetSettings);
+  server.on("/settings", HTTP_POST, handleSaveSettings);
+  server.on("/filters", HTTP_POST, handleSaveFilters);
+  server.on("/pc/power", HTTP_POST, handlePcPowerControl);
+  server.on("/lcd/status", HTTP_GET, handleLcdStatus);
+  server.on("/lcd/control", HTTP_POST, handleLcdControl);
   server.on("/health", HTTP_GET, []() {
-    server.send(
-      200,
-      "application/json",
-      "{\"ok\":true,\"device\":\"ESP8266\"}"
-    );
+    String json = "{\"ok\":true,\"device\":\"ESP8266\",\"freeHeap\":";
+    json += String(ESP.getFreeHeap());
+    json += ",\"jsonBytes\":";
+    json += String(latestJson.length());
+    json += "}";
+    server.send(200, "application/json", json);
   });
   server.onNotFound([]() {
-    server.send(
-      404,
-      "text/plain",
-      "404 - Endpoint not found"
-    );
+    server.send(404, "text/plain", "404 - Endpoint not found");
   });
-// Start the HTTP server.
   server.begin();
-  // Serve green Command favicon.
-server.on("/favicon.svg", HTTP_GET, []() {
-  server.send_P(
-    200,
-    "image/svg+xml",
-    R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-<rect width="64" height="64" rx="12" fill="#0b1120"/>
-<text x="32" y="46"
-      font-family="Arial,sans-serif"
-      font-size="44"
-      text-anchor="middle"
-      fill="#4ade80">&#8984;</text>
-</svg>)SVG"
-  );
-});
-
-// Start the HTTP server.
-server.begin();
-// Serve green Command favicon.
-server.on("/favicon.svg", HTTP_GET, []() {
-  server.send_P(
-    200,
-    "image/svg+xml",
-    R"SVG(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-<rect width="64" height="64" rx="12" fill="#0b1120"/>
-<text x="32" y="46"
-      font-family="Arial,sans-serif"
-      font-size="44"
-      text-anchor="middle"
-      fill="#4ade80">&#8984;</text>
-</svg>)SVG"
-  );
-});
-Serial.println(F("HTTP server started"));
   Serial.println(F("HTTP server started"));
   Serial.print(F("Dashboard URL: http://"));
   Serial.println(WiFi.localIP());
-  Serial.println(F("API endpoint: /api"));
-  Serial.println(F("Data endpoint: /data"));
-// Initialize display timers.
   lastLcdPage = millis();
   lastBmpRead = 0;
   lcdPage = 0;
@@ -2471,22 +2338,14 @@ Serial.println(F("HTTP server started"));
 }
 // MAIN LOOP
 void loop() {
-// Handle incoming HTTP requests.
   server.handleClient();
-// Process queued ESP-NOW commands.
   processOptoCommands();
-// Read BMP280 approximately once per second.
   readBmp();
-// Rotate LCD page every 3 seconds.
   if (millis() - lastLcdPage >= 3000) {
     lastLcdPage = millis();
-    lcdPage++;
-    if (lcdPage >= 5) {
-      lcdPage = 0;
-    }
+    lcdPage = (lcdPage + 1) % 5;
     showLcdPage();
   }
-// Reconnect to Wi-Fi if disconnected.
   static unsigned long lastWiFiCheck = 0;
   if (millis() - lastWiFiCheck >= 5000) {
     lastWiFiCheck = millis();
@@ -2495,6 +2354,5 @@ void loop() {
       WiFi.reconnect();
     }
   }
-// Allow background Wi-Fi and TCP/IP tasks to run.
   yield();
 }

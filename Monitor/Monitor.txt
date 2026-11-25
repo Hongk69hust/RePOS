@@ -1,0 +1,1746 @@
+/*
+   This program is used for Monitor (I used esp32 with 3.5" touch screen module)
+   This is program for MCU receiving data from url, you can see infomations showing
+  on the screen about gpu, cpu, case temperature and PC power.
+   You can use screen to see temperature chart in 60s, turn on/off relay and lcd screenm
+  adjust color, brightness.
+   Author: Chu Xuân Hồng
+   Time (dd/mm/yyyy): 25/11/2006
+*/
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <LovyanGFX.hpp>
+#include <lvgl.h>
+#include <esp_heap_caps.h>
+#include <time.h>
+#include <math.h>
+#include <strings.h>
+#define DEBUG_TOUCH 0
+// 1. WIFI + API + NTP CONFIG
+const char* WIFI_SSID       = "";
+const char* WIFI_PASS       = "";
+const char* API_URL         = "http://192.168.1.115/api";
+const char* POWER_URL       = "http://192.168.1.115/pc/power";
+const char* LCD_STATUS_URL  = "http://192.168.1.115/lcd/status";
+const char* LCD_CONTROL_URL = "http://192.168.1.115/lcd/control";
+const long  GMT_OFFSET_SEC      = 7 * 3600; // UTC +7:00 (Việt Nam)
+const int   DAYLIGHT_OFFSET_SEC = 0;
+const uint32_t REFRESH_INTERVAL     = 1000;
+const uint32_t LCD_REFRESH_INTERVAL = 5000;
+const uint32_t WIFI_RETRY_INTERVAL  = 5000;
+const uint32_t BOOT_TIMEOUT_MS      = 10000;
+#define BACKLIGHT_PIN 27
+const float TEMP_YELLOW      = 75.0f;
+const float TEMP_RED         = 95.0f;
+const float AMBIENT_YELLOW   = 45.0f;
+const float AMBIENT_RED      = 55.0f;
+const float POWER_YELLOW     = 800.0f;
+const float POWER_RED        = 900.0f;
+// 2. HARDWARE: ST7796 + GT911
+class LGFX_Escreen : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7796 _panel;
+  lgfx::Bus_SPI      _bus;
+  lgfx::Touch_GT911  _touch;
+public:
+  LGFX_Escreen() {
+    {
+      auto cfg = _bus.config();
+      cfg.spi_host   = VSPI_HOST;
+      cfg.spi_mode   = 0;
+      cfg.freq_write = 40000000;
+      cfg.freq_read  = 16000000;
+      cfg.pin_sclk   = 18;
+      cfg.pin_mosi   = 23;
+      cfg.pin_miso   = 19;
+      cfg.pin_dc     = 2;
+      _bus.config(cfg);
+      _panel.setBus(&_bus);
+    }
+    {
+      auto cfg = _panel.config();
+      cfg.pin_cs       = 15;
+      cfg.pin_rst      = 4;
+      cfg.panel_width  = 320;
+      cfg.panel_height = 480;
+      cfg.offset_x     = 0;
+      cfg.offset_y     = 0;
+      cfg.readable     = true;
+      cfg.invert       = true;
+      cfg.rgb_order    = false;
+      cfg.dlen_16bit   = false;
+      cfg.bus_shared   = false;
+      _panel.config(cfg);
+    }
+    {
+      auto cfg = _touch.config();
+      cfg.x_min    = 0;
+      cfg.x_max    = 319;
+      cfg.y_min    = 0;
+      cfg.y_max    = 479;
+      cfg.pin_sda  = 21;
+      cfg.pin_scl  = 22;
+      cfg.pin_int  = 32;
+      cfg.pin_rst  = 33;
+      cfg.i2c_port = 1;
+      cfg.freq     = 200000;
+      _touch.config(cfg);
+      _panel.setTouch(&_touch);
+    }
+    setPanel(&_panel);
+  }
+};
+LGFX_Escreen lcd;
+Preferences prefs;
+uint8_t  currentBrightness = 100; //
+uint16_t currentHue        = 142; // 
+uint8_t  currentSat        = 70;  //
+// 3. LVGL FONTS & DYNAMIC HSV THEME PALETTE
+#if LV_FONT_MONTSERRAT_28
+  #define FONT_BOOT (&lv_font_montserrat_28)
+#elif LV_FONT_MONTSERRAT_22
+  #define FONT_BOOT (&lv_font_montserrat_22)
+#else
+  #define FONT_BOOT LV_FONT_DEFAULT
+#endif
+#if LV_FONT_MONTSERRAT_22
+  #define FONT_VAL (&lv_font_montserrat_22)
+#elif LV_FONT_MONTSERRAT_20
+  #define FONT_VAL (&lv_font_montserrat_20)
+#elif LV_FONT_MONTSERRAT_18
+  #define FONT_VAL (&lv_font_montserrat_18)
+#else
+  #define FONT_VAL LV_FONT_DEFAULT
+#endif
+#if LV_FONT_MONTSERRAT_16
+  #define FONT_TITLE (&lv_font_montserrat_16)
+#else
+  #define FONT_TITLE LV_FONT_DEFAULT
+#endif
+#if LV_FONT_MONTSERRAT_14
+  #define FONT_CARD (&lv_font_montserrat_14)
+#else
+  #define FONT_CARD LV_FONT_DEFAULT
+#endif
+#if LV_FONT_MONTSERRAT_12
+  #define FONT_SM (&lv_font_montserrat_12)
+#else
+  #define FONT_SM LV_FONT_DEFAULT
+#endif
+#define COL_BG            lv_color_hex(0x060A13)
+#define COL_HEADER        lv_color_hex(0x060A13)
+#define COL_BORDER_BASE   lv_color_hex(0x1E293B)
+#define COL_TEXT          lv_color_hex(0xE8EEF8)
+#define COL_MUTED         lv_color_hex(0x93A4BB)
+#define COL_BLACK         lv_color_hex(0x000000)
+// WARNING (.level-yellow)
+#define COL_WARN_BG       lv_color_hex(0x30270E)
+#define COL_WARN_BORDER   lv_color_hex(0x8D711B)
+#define COL_WARN_TRACK    lv_color_hex(0x453915)
+#define COL_WARN_VAL      lv_color_hex(0xFACC15)
+// CRITICAL (.level-red)
+#define COL_CRIT_BG       lv_color_hex(0x351717)
+#define COL_CRIT_BORDER   lv_color_hex(0x963B42)
+#define COL_CRIT_TRACK    lv_color_hex(0x4C2123)
+#define COL_CRIT_VAL      lv_color_hex(0xFB7185)
+// NONE (.level-gray)
+#define COL_NONE_BG       lv_color_hex(0x151F30)
+#define COL_NONE_BORDER   lv_color_hex(0x475569)
+#define COL_NONE_TRACK    lv_color_hex(0x223047)
+#define COL_NONE_VAL      lv_color_hex(0xCBD5E1)
+// Chart line colors
+#define COL_LINE_CPU      lv_color_hex(0x4ADE80)
+#define COL_LINE_GPU      lv_color_hex(0x60A5FA)
+#define COL_LINE_CASE     lv_color_hex(0xFACC15)
+struct PresetSwatch {
+  uint16_t hue;
+  uint8_t  sat;
+};
+const PresetSwatch COLOR_PRESETS[] = {
+  { 142, 70 }, // 0: Green (Default)
+  { 190, 75 }, // 1: Cyan
+  { 215, 75 }, // 2: Blue
+  { 268, 72 }, // 3: Purple
+  { 326, 72 }, // 4: Pink
+  {   4, 75 }, // 5: Red
+  {  28, 78 }, // 6: Orange
+  { 210,  0 }  // 7: White
+};
+const uint8_t PRESET_COUNT = sizeof(COLOR_PRESETS) / sizeof(COLOR_PRESETS[0]);
+inline lv_color_t themeBg() {
+  uint8_t s = (currentSat == 0) ? 0 : min((int)currentSat, 62);
+  return lv_color_hsv_to_rgb(currentHue % 360, s, 17);
+}
+inline lv_color_t themeBorder() {
+  return lv_color_hsv_to_rgb(currentHue % 360, currentSat, 45);
+}
+inline lv_color_t themeTrack() {
+  uint8_t s = (currentSat == 0) ? 0 : min((int)currentSat, 65);
+  return lv_color_hsv_to_rgb(currentHue % 360, s, 26);
+}
+inline lv_color_t themeVal() {
+  return lv_color_hsv_to_rgb(currentHue % 360, currentSat, 92);
+}
+// 4. SHARED SENSOR & COMMAND DATA
+#define CMD_IDLE    0
+#define CMD_SENDING 1
+#define CMD_OK      2
+#define CMD_ERR     3
+struct TelemetryData {
+  float caseTemp = NAN;
+  float cpuTemp  = NAN;
+  float gpuTemp  = NAN;
+  float pcPower  = NAN;
+  bool wifiConnected = false;
+  bool mcuOnline     = false;
+  bool pcOnline      = false;
+  uint32_t sampleSeq = 0;
+  bool powerCmdRequested = false;
+  int powerCmdResult     = CMD_IDLE;
+  uint32_t powerCmdSeq   = 0;
+  bool lcdKnown          = false;
+  bool lcdEnabled        = true;
+  bool lcdCmdRequested   = false;
+  bool lcdCmdTarget      = false;
+  int lcdCmdResult       = CMD_IDLE;
+  uint32_t lcdSeq        = 0;
+  uint32_t lcdCmdSeq     = 0;
+};
+TelemetryData sharedData;
+SemaphoreHandle_t dataMutex = nullptr;
+uint32_t lastRenderedSeq    = 0;
+uint32_t lastPowerSeq       = 0;
+uint32_t powerFeedbackUntil = 0;
+uint32_t lastLcdSeq         = 0;
+uint32_t lastLcdCmdSeq      = 0;
+uint32_t lcdFeedbackUntil   = 0;
+bool lcdSending             = false;
+bool uiLcdKnown             = false;
+bool uiLcdEnabled           = true;
+int lastConnState           = -1;
+bool isChartTab             = false;
+time_t lastClockSec         = -1;
+uint32_t bootStartMs        = 0;
+uint32_t bootCompleteMs     = 0;
+uint32_t gaugeSweepAtMs     = 0;
+bool bootDone               = false;
+int lastBootStage           = -1;
+int32_t lastBootPct         = -1;
+// 5. BACKLIGHT PWM + JSON HELPERS + HTTP CLIENT
+void applyBacklightPwm(uint8_t pct) {
+  pct = constrain((int)pct, 5, 100);
+  currentBrightness = pct;
+  uint32_t duty = (uint32_t)roundf(pct * 2.55f);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(BACKLIGHT_PIN, duty);
+#else
+  ledcWrite(0, duty);
+#endif
+}
+bool equalsIgnoreCase(const char* a, const char* b) {
+  if (!a || !b) return false;
+  return strcasecmp(a, b) == 0;
+}
+JsonVariantConst getMember(JsonObjectConst obj, const char* target) {
+  for (JsonPairConst pair : obj) {
+    if (equalsIgnoreCase(pair.key().c_str(), target)) {
+      return pair.value();
+    }
+  }
+  return JsonVariantConst();
+}
+float jsonToFloat(JsonVariantConst value) {
+  if (value.isNull()) return NAN;
+  if (value.is<float>() || value.is<int>() || value.is<double>()) {
+    float result = value.as<float>();
+    if (isfinite(result)) return result;
+  }
+  if (value.is<const char*>()) {
+    const char* str = value.as<const char*>();
+    if (str && str[0] != '\0') {
+      char* endPtr;
+      float result = strtof(str, &endPtr);
+      if (endPtr != str && isfinite(result)) return result;
+    }
+  }
+  return NAN;
+}
+float findSensorRecursive(JsonVariantConst node, const char* targetName, int depth = 0) {
+  if (depth > 15) return NAN;
+  if (node.is<JsonObjectConst>()) {
+    JsonObjectConst obj = node.as<JsonObjectConst>();
+    JsonVariantConst nameValue = getMember(obj, "name");
+    if (nameValue.isNull()) nameValue = getMember(obj, "sensorName");
+    if (nameValue.is<const char*>()) {
+      if (equalsIgnoreCase(nameValue.as<const char*>(), targetName)) {
+        JsonVariantConst value = getMember(obj, "value");
+        if (value.isNull()) value = getMember(obj, "ValueFormatted");
+        float result = jsonToFloat(value);
+        if (isfinite(result)) return result;
+      }
+    }
+    for (JsonPairConst pair : obj) {
+      float result = findSensorRecursive(pair.value(), targetName, depth + 1);
+      if (isfinite(result)) return result;
+    }
+  } else if (node.is<JsonArrayConst>()) {
+    for (JsonVariantConst item : node.as<JsonArrayConst>()) {
+      float result = findSensorRecursive(item, targetName, depth + 1);
+      if (isfinite(result)) return result;
+    }
+  }
+  return NAN;
+}
+float findRootValue(JsonDocument& doc, const char* name) {
+  return jsonToFloat(getMember(doc.as<JsonObjectConst>(), name));
+}
+bool fetchData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      sharedData.wifiConnected = false;
+      sharedData.mcuOnline     = false;
+      sharedData.pcOnline      = false;
+      if (sharedData.lcdKnown) {
+        sharedData.lcdKnown = false;
+        sharedData.lcdSeq++;
+      }
+      sharedData.sampleSeq++;
+      xSemaphoreGive(dataMutex);
+    }
+    return false;
+  }
+  HTTPClient http;
+  http.setTimeout(2000);
+  http.begin(API_URL);
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("HTTP Error: %d\n", httpCode);
+    http.end();
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      sharedData.wifiConnected = true;
+      sharedData.mcuOnline     = false;
+      sharedData.pcOnline      = false;
+      if (sharedData.lcdKnown) {
+        sharedData.lcdKnown = false;
+        sharedData.lcdSeq++;
+      }
+      sharedData.sampleSeq++;
+      xSemaphoreGive(dataMutex);
+    }
+    return false;
+  }
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, http.getStream());
+  http.end();
+  if (error) {
+    Serial.printf("JSON Error: %s\n", error.c_str());
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      sharedData.wifiConnected = true;
+      sharedData.mcuOnline     = false;
+      sharedData.pcOnline      = false;
+      sharedData.sampleSeq++;
+      xSemaphoreGive(dataMutex);
+    }
+    return false;
+  }
+  float newCase  = findRootValue(doc, "ambientTempC");
+  float newPower = findRootValue(doc, "realPowerWatts");
+  float ageMs    = findRootValue(doc, "lastPcDataAgeMs");
+  float newCPU   = findSensorRecursive(doc.as<JsonVariantConst>(), "Core Max");
+  float newGPU   = findSensorRecursive(doc.as<JsonVariantConst>(), "GPU Core");
+  bool pcIsLive = isfinite(ageMs) && (ageMs <= 5000.0f);
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+    sharedData.wifiConnected = true;
+    sharedData.caseTemp      = newCase;
+    sharedData.cpuTemp       = pcIsLive ? newCPU   : NAN;
+    sharedData.gpuTemp       = pcIsLive ? newGPU   : NAN;
+    sharedData.pcPower       = pcIsLive ? newPower : NAN;
+    sharedData.mcuOnline     = true;
+    sharedData.pcOnline      = pcIsLive;
+    sharedData.sampleSeq++;
+    xSemaphoreGive(dataMutex);
+  }
+  return true;
+}
+bool sendPcPowerCommand() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.setTimeout(2500);
+  http.begin(POWER_URL);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST("{\"press\":true}");
+  http.end();
+
+  Serial.printf("POST /pc/power -> HTTP %d\n", code);
+  return (code == 202 || code == 200);
+}
+bool fetchLcdStatus() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.setTimeout(2000);
+  http.begin(LCD_STATUS_URL);
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err || !doc["lcdEnabled"].is<bool>()) {
+    return false;
+  }
+  bool enabled = doc["lcdEnabled"].as<bool>();
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+    if (!sharedData.lcdKnown || sharedData.lcdEnabled != enabled) {
+      sharedData.lcdKnown   = true;
+      sharedData.lcdEnabled = enabled;
+      sharedData.lcdSeq++;
+    }
+    xSemaphoreGive(dataMutex);
+  }
+  return true;
+}
+bool sendLcdControlCommand(bool targetState, bool* outEnabled) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.setTimeout(2500);
+  http.begin(LCD_CONTROL_URL);
+  http.addHeader("Content-Type", "application/json");
+  const char* body = targetState ? "{\"enabled\":true}" : "{\"enabled\":false}";
+  int code = http.POST(body);
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    Serial.printf("POST /lcd/control -> HTTP %d\n", code);
+    return false;
+  }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err || !(doc["ok"] | false) || !doc["lcdEnabled"].is<bool>()) {
+    return false;
+  }
+  *outEnabled = doc["lcdEnabled"].as<bool>();
+  Serial.printf("POST /lcd/control -> HTTP %d (lcdEnabled=%s)\n",
+                code, *outEnabled ? "true" : "false");
+  return true;
+}
+// 6. BACKGROUND NETWORK TASK (CORE 0)
+void networkTask(void* param) {
+  uint32_t lastWiFiCheck = 0;
+  uint32_t lastFetch     = 0;
+  uint32_t lastLcdFetch  = 0;
+  bool ntpStarted        = false;
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (true) {
+    uint32_t now = millis();
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);
+    if (wifiOk && !ntpStarted) {
+      ntpStarted = true;
+      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC,
+                 "pool.ntp.org", "time.google.com", "time.nist.gov");
+      Serial.println("NTP UTC+7 sync started");
+    }
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      sharedData.wifiConnected = wifiOk;
+      xSemaphoreGive(dataMutex);
+    }
+    bool doPower   = false;
+    bool doLcd     = false;
+    bool lcdTarget = false;
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      if (sharedData.powerCmdRequested) {
+        sharedData.powerCmdRequested = false;
+        doPower = true;
+      }
+      if (sharedData.lcdCmdRequested) {
+        sharedData.lcdCmdRequested = false;
+        lcdTarget = sharedData.lcdCmdTarget;
+        doLcd = true;
+      }
+      xSemaphoreGive(dataMutex);
+    }
+    if (doPower) {
+      bool ok = sendPcPowerCommand();
+      if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+        sharedData.powerCmdResult = ok ? CMD_OK : CMD_ERR;
+        sharedData.powerCmdSeq++;
+        xSemaphoreGive(dataMutex);
+      }
+    }
+    if (doLcd) {
+      bool actualEnabled = lcdTarget;
+      bool ok = sendLcdControlCommand(lcdTarget, &actualEnabled);
+      if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+        sharedData.lcdCmdResult = ok ? CMD_OK : CMD_ERR;
+        if (ok) {
+          sharedData.lcdKnown   = true;
+          sharedData.lcdEnabled = actualEnabled;
+          sharedData.lcdSeq++;
+        }
+        sharedData.lcdCmdSeq++;
+        xSemaphoreGive(dataMutex);
+      }
+      lastLcdFetch = millis();
+    }
+    if (!wifiOk && (now - lastWiFiCheck >= WIFI_RETRY_INTERVAL)) {
+      lastWiFiCheck = now;
+      Serial.println("WiFi reconnecting...");
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    if (wifiOk && (lastFetch == 0 || (now - lastFetch >= REFRESH_INTERVAL))) {
+      lastFetch = now;
+      bool ok = fetchData();
+      if (!ok) {
+        lastLcdFetch = 0;
+      }
+    }
+    if (wifiOk && (lastLcdFetch == 0 || (now - lastLcdFetch >= LCD_REFRESH_INTERVAL))) {
+      lastLcdFetch = now;
+      fetchLcdStatus();
+    }
+    vTaskDelay(pdMS_TO_TICKS(40));
+  }
+}
+// 7. LVGL DOUBLE-BUFFER DMA DISPLAY & OPTIMIZED TOUCH DRIVER
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t* buf1 = nullptr;
+static lv_color_t* buf2 = nullptr;
+void my_disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+  if (lcd.getStartCount() == 0) {
+    lcd.startWrite();
+  }
+#if LV_COLOR_16_SWAP
+  lcd.pushImageDMA(area->x1, area->y1, w, h, (lgfx::swap565_t*)&color_p->full);
+#else
+  lcd.pushImageDMA(area->x1, area->y1, w, h, (lgfx::rgb565_t*)&color_p->full);
+#endif
+  lv_disp_flush_ready(disp);
+}
+void my_touchpad_read(lv_indev_drv_t* indev_driver, lv_indev_data_t* data) {
+  static bool     lastPressed = false;
+  static uint16_t lastX       = 0;
+  static uint16_t lastY       = 0;
+  static uint32_t lastTouchMs = 0;
+  uint16_t tx = 0, ty = 0;
+  bool touched = lcd.getTouch(&tx, &ty);
+  if (!touched && lastPressed) {
+    touched = lcd.getTouch(&tx, &ty);
+  }
+  uint32_t now = millis();
+  if (touched) {
+    tx = (uint16_t)constrain((int)tx, 0, 479);
+    ty = (uint16_t)constrain((int)ty, 0, 319);
+    if (lastPressed) {
+      if (abs((int)tx - (int)lastX) <= 2 && abs((int)ty - (int)lastY) <= 2) {
+        tx = lastX;
+        ty = lastY;
+      }
+    }
+    lastPressed = true;
+    lastX       = tx;
+    lastY       = ty;
+    lastTouchMs = now;
+    data->state   = LV_INDEV_STATE_PR;
+    data->point.x = tx;
+    data->point.y = ty;
+#if DEBUG_TOUCH
+    static uint32_t lastTouchLog = 0;
+    if (now - lastTouchLog > 200) {
+      lastTouchLog = now;
+      Serial.printf("Touch: X=%u Y=%u\n", tx, ty);
+    }
+#endif
+  } else if (lastPressed && (now - lastTouchMs < 18)) {
+    data->state   = LV_INDEV_STATE_PR;
+    data->point.x = lastX;
+    data->point.y = lastY;
+  } else {
+    lastPressed   = false;
+    data->state   = LV_INDEV_STATE_REL;
+    data->point.x = lastX;
+    data->point.y = lastY;
+  }
+}
+// 8. UI STRUCTS & HELPERS
+#define STATUS_INIT     -1
+#define STATUS_NONE      0
+#define STATUS_NORMAL    1
+#define STATUS_WARNING   2
+#define STATUS_CRITICAL  3
+#define CARD_CPU   0
+#define CARD_GPU   1
+#define CARD_CASE  2
+#define CARD_PWR   3
+struct GaugeCard {
+  lv_obj_t* card;
+  lv_obj_t* dot;
+  lv_obj_t* arc;
+  lv_obj_t* valLbl;
+  lv_obj_t* unitLbl;
+  lv_obj_t* alertPill;
+  lv_obj_t* alertLbl;
+  int32_t minRange;
+  int32_t maxRange;
+  int currentStatus;
+  char lastText[16];
+};
+struct UIHandles {
+  lv_obj_t* pageSplash;
+  lv_obj_t* bootBar;
+  lv_obj_t* bootStatusLbl;
+  lv_obj_t* iconBox;
+  lv_obj_t* iconParts[5];
+  lv_obj_t* statusDot;
+  lv_obj_t* statusLbl;
+  lv_obj_t* clockLbl;
+  lv_obj_t* btnTabLive;
+  lv_obj_t* btnTabChart;
+  lv_obj_t* btnPower;
+  lv_obj_t* btnPowerLbl;
+  lv_obj_t* btnLcd;
+  lv_obj_t* btnLcdLbl;
+  lv_obj_t* powerModal;
+  lv_obj_t* powerDlg;
+  lv_obj_t* btnPowerConfirm;
+  lv_obj_t* lblPowerConfirm;
+  lv_obj_t* brightModal;
+  lv_obj_t* brightDlg;
+  lv_obj_t* brightSlider;
+  lv_obj_t* brightValLbl;
+  lv_obj_t* colorPreview;
+  lv_obj_t* hueSlider;
+  lv_obj_t* btnBrightDone;
+  lv_obj_t* lblBrightDone;
+  lv_obj_t* swatchBtns[8];
+  lv_obj_t* swatchChecks[8];
+  lv_obj_t* pageLive;
+  lv_obj_t* pageChart;
+  GaugeCard cards[4];
+  lv_obj_t* chart;
+  lv_chart_series_t* serCpu;
+  lv_chart_series_t* serGpu;
+  lv_chart_series_t* serCase;
+  lv_obj_t* legCpuLbl;
+  lv_obj_t* legGpuLbl;
+  lv_obj_t* legCaseLbl;
+} ui;
+void arcAnimExecCb(void* obj, int32_t v) {
+  lv_arc_set_value((lv_obj_t*)obj, v);
+}
+void setArcAnimated(lv_obj_t* arc, int32_t targetVal) {
+  int32_t cur = lv_arc_get_value(arc);
+  if (cur == targetVal) return;
+  lv_anim_del(arc, arcAnimExecCb);
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, arc);
+  lv_anim_set_exec_cb(&a, arcAnimExecCb);
+  lv_anim_set_time(&a, 320);
+  lv_anim_set_values(&a, cur, targetVal);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+  lv_anim_start(&a);
+}
+void drawCommandIcon(lv_obj_t* parent, lv_color_t col, lv_obj_t** outParts) {
+  const int loopPos[4][2] = { {6, 6}, {19, 6}, {6, 19}, {19, 19} };
+  for (int i = 0; i < 4; i++) {
+    lv_obj_t* loop = lv_obj_create(parent);
+    lv_obj_set_pos(loop, loopPos[i][0], loopPos[i][1]);
+    lv_obj_set_size(loop, 7, 7);
+    lv_obj_set_style_bg_opa(loop, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(loop, col, 0);
+    lv_obj_set_style_border_width(loop, 2, 0);
+    lv_obj_set_style_radius(loop, 3, 0);
+    lv_obj_set_style_pad_all(loop, 0, 0);
+    lv_obj_clear_flag(loop, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    if (outParts) outParts[i] = loop;
+  }
+  lv_obj_t* center = lv_obj_create(parent);
+  lv_obj_set_pos(center, 11, 11);
+  lv_obj_set_size(center, 10, 10);
+  lv_obj_set_style_bg_opa(center, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(center, col, 0);
+  lv_obj_set_style_border_width(center, 2, 0);
+  lv_obj_set_style_radius(center, 0, 0);
+  lv_obj_set_style_pad_all(center, 0, 0);
+  lv_obj_clear_flag(center, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  if (outParts) outParts[4] = center;
+}
+void drawCommandIconLarge(lv_obj_t* parent, lv_color_t col) {
+  const int loopPos[4][2] = { {6, 6}, {28, 6}, {6, 28}, {28, 28} };
+  for (int i = 0; i < 4; i++) {
+    lv_obj_t* loop = lv_obj_create(parent);
+    lv_obj_set_pos(loop, loopPos[i][0], loopPos[i][1]);
+    lv_obj_set_size(loop, 12, 12);
+    lv_obj_set_style_bg_opa(loop, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(loop, col, 0);
+    lv_obj_set_style_border_width(loop, 3, 0);
+    lv_obj_set_style_radius(loop, 5, 0);
+    lv_obj_set_style_pad_all(loop, 0, 0);
+    lv_obj_clear_flag(loop, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  }
+  lv_obj_t* center = lv_obj_create(parent);
+  lv_obj_set_pos(center, 15, 15);
+  lv_obj_set_size(center, 16, 16);
+  lv_obj_set_style_bg_opa(center, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(center, col, 0);
+  lv_obj_set_style_border_width(center, 3, 0);
+  lv_obj_set_style_radius(center, 0, 0);
+  lv_obj_set_style_pad_all(center, 0, 0);
+  lv_obj_clear_flag(center, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+}
+void setPowerBtnVisual(int state) {
+  if (state == CMD_SENDING) {
+    lv_obj_set_style_bg_color(ui.btnPower, COL_WARN_BG, 0);
+    lv_obj_set_style_border_color(ui.btnPower, COL_WARN_BORDER, 0);
+    lv_obj_set_style_text_color(ui.btnPowerLbl, COL_WARN_VAL, 0);
+    lv_label_set_text(ui.btnPowerLbl, "SENDING...");
+  } else if (state == CMD_OK) {
+    lv_obj_set_style_bg_color(ui.btnPower, themeBg(), 0);
+    lv_obj_set_style_border_color(ui.btnPower, themeVal(), 0);
+    lv_obj_set_style_text_color(ui.btnPowerLbl, themeVal(), 0);
+    lv_label_set_text(ui.btnPowerLbl, "SENT!");
+  } else if (state == CMD_ERR) {
+    lv_obj_set_style_bg_color(ui.btnPower, COL_CRIT_BG, 0);
+    lv_obj_set_style_border_color(ui.btnPower, COL_CRIT_BORDER, 0);
+    lv_obj_set_style_text_color(ui.btnPowerLbl, COL_CRIT_VAL, 0);
+    lv_label_set_text(ui.btnPowerLbl, "FAILED");
+  } else {
+    lv_obj_set_style_bg_color(ui.btnPower, themeBg(), 0);
+    lv_obj_set_style_border_color(ui.btnPower, themeBorder(), 0);
+    lv_obj_set_style_text_color(ui.btnPowerLbl, themeVal(), 0);
+    lv_label_set_text(ui.btnPowerLbl, LV_SYMBOL_POWER " POWER");
+  }
+}
+void setLcdBtnVisual(int cmdState, bool known, bool enabled) {
+  if (strcmp(lv_label_get_text(ui.btnLcdLbl), "LCD") != 0) {
+    lv_label_set_text(ui.btnLcdLbl, "LCD");
+  }
+  if (cmdState == CMD_ERR) {
+    lv_obj_set_style_bg_color(ui.btnLcd, COL_WARN_BG, 0);
+    lv_obj_set_style_border_color(ui.btnLcd, COL_WARN_BORDER, 0);
+    lv_obj_set_style_text_color(ui.btnLcdLbl, COL_WARN_VAL, 0);
+  } else if (cmdState == CMD_SENDING) {
+    lv_obj_set_style_bg_color(ui.btnLcd, COL_NONE_BG, 0);
+    lv_obj_set_style_border_color(ui.btnLcd, COL_BORDER_BASE, 0);
+    lv_obj_set_style_text_color(ui.btnLcdLbl, COL_TEXT, 0);
+  } else if (known && enabled) {
+    lv_obj_set_style_bg_color(ui.btnLcd, themeBg(), 0);
+    lv_obj_set_style_border_color(ui.btnLcd, themeBorder(), 0);
+    lv_obj_set_style_text_color(ui.btnLcdLbl, themeVal(), 0);
+  } else {
+    lv_obj_set_style_bg_color(ui.btnLcd, COL_BLACK, 0);
+    lv_obj_set_style_border_color(ui.btnLcd, COL_BORDER_BASE, 0);
+    lv_obj_set_style_text_color(ui.btnLcdLbl, COL_MUTED, 0);
+  }
+}
+void applyCardTheme(int idx, int lvl) {
+  GaugeCard& gc = ui.cards[idx];
+  if (gc.currentStatus == lvl) return;
+  gc.currentStatus = lvl;
+  lv_color_t bg, border, track, valCol;
+  const char* statusText;
+  switch (lvl) {
+    case STATUS_NORMAL:
+      bg = themeBg(); border = themeBorder(); track = themeTrack(); valCol = themeVal();
+      statusText = "NORMAL";
+      break;
+    case STATUS_WARNING:
+      bg = COL_WARN_BG; border = COL_WARN_BORDER; track = COL_WARN_TRACK; valCol = COL_WARN_VAL;
+      statusText = "WARNING";
+      break;
+    case STATUS_CRITICAL:
+      bg = COL_CRIT_BG; border = COL_CRIT_BORDER; track = COL_CRIT_TRACK; valCol = COL_CRIT_VAL;
+      statusText = "CRITICAL";
+      break;
+    default:
+      bg = COL_NONE_BG; border = COL_NONE_BORDER; track = COL_NONE_TRACK; valCol = COL_NONE_VAL;
+      statusText = "NONE";
+      break;
+  }
+  lv_obj_set_style_bg_color(gc.card, bg, 0);
+  lv_obj_set_style_border_color(gc.card, border, 0);
+  lv_obj_set_style_bg_color(gc.dot, valCol, 0);
+  lv_obj_set_style_arc_color(gc.arc, track, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(gc.arc, valCol, LV_PART_INDICATOR);
+  lv_obj_set_style_text_color(gc.valLbl, valCol, 0);
+  lv_obj_set_style_bg_color(gc.alertPill, track, 0);
+  lv_obj_set_style_border_color(gc.alertPill, border, 0);
+  lv_obj_set_style_text_color(gc.alertLbl, valCol, 0);
+  lv_label_set_text(gc.alertLbl, statusText);
+}
+void createGaugeCard(
+  lv_obj_t* parent,
+  int idx,
+  int x, int y, int w, int h,
+  const char* title,
+  const char* unit,
+  int32_t minVal,
+  int32_t maxVal
+) {
+  GaugeCard& gc = ui.cards[idx];
+  gc.minRange = minVal;
+  gc.maxRange = maxVal;
+  gc.currentStatus = STATUS_INIT;
+  strcpy(gc.lastText, "--.-");
+  gc.card = lv_obj_create(parent);
+  lv_obj_set_pos(gc.card, x, y);
+  lv_obj_set_size(gc.card, w, h);
+  lv_obj_set_style_bg_opa(gc.card, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(gc.card, 1, 0);
+  lv_obj_set_style_radius(gc.card, 12, 0);
+  lv_obj_set_style_pad_all(gc.card, 0, 0);
+  lv_obj_clear_flag(gc.card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  gc.dot = lv_obj_create(gc.card);
+  lv_obj_set_size(gc.dot, 7, 7);
+  lv_obj_set_pos(gc.dot, 12, 13);
+  lv_obj_set_style_radius(gc.dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_border_width(gc.dot, 0, 0);
+  lv_obj_clear_flag(gc.dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t* lblTitle = lv_label_create(gc.card);
+  lv_label_set_text(lblTitle, title);
+  lv_obj_set_style_text_font(lblTitle, FONT_CARD, 0);
+  lv_obj_set_style_text_color(lblTitle, COL_MUTED, 0);
+  lv_obj_set_pos(lblTitle, 24, 9);
+  gc.arc = lv_arc_create(gc.card);
+  lv_obj_set_size(gc.arc, 86, 86);
+  lv_obj_align(gc.arc, LV_ALIGN_BOTTOM_MID, -12, -5);
+  lv_arc_set_rotation(gc.arc, 135);
+  lv_arc_set_bg_angles(gc.arc, 0, 270);
+  lv_arc_set_range(gc.arc, minVal, maxVal);
+  lv_arc_set_value(gc.arc, minVal);
+  lv_obj_remove_style(gc.arc, NULL, LV_PART_KNOB);
+  lv_obj_clear_flag(gc.arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_width(gc.arc, 8, LV_PART_MAIN);
+  lv_obj_set_style_arc_rounded(gc.arc, true, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(gc.arc, 8, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_rounded(gc.arc, true, LV_PART_INDICATOR);
+  gc.valLbl = lv_label_create(gc.card);
+  lv_label_set_text(gc.valLbl, "--.-");
+  lv_obj_set_style_text_font(gc.valLbl, FONT_VAL, 0);
+  lv_obj_align_to(gc.valLbl, gc.arc, LV_ALIGN_CENTER, 0, -4);
+  gc.unitLbl = lv_label_create(gc.card);
+  lv_label_set_text(gc.unitLbl, unit);
+  lv_obj_set_style_text_font(gc.unitLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(gc.unitLbl, COL_MUTED, 0);
+  lv_obj_align_to(gc.unitLbl, gc.arc, LV_ALIGN_CENTER, 0, 19);
+  gc.alertPill = lv_obj_create(gc.card);
+  lv_obj_set_size(gc.alertPill, LV_SIZE_CONTENT, 20);
+  lv_obj_set_style_pad_hor(gc.alertPill, 7, 0);
+  lv_obj_set_style_pad_ver(gc.alertPill, 0, 0);
+  lv_obj_set_style_border_width(gc.alertPill, 1, 0);
+  lv_obj_set_style_radius(gc.alertPill, 6, 0);
+  lv_obj_set_style_bg_opa(gc.alertPill, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(gc.alertPill, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_align(gc.alertPill, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+  gc.alertLbl = lv_label_create(gc.alertPill);
+  lv_label_set_text(gc.alertLbl, "NONE");
+  lv_obj_set_style_text_font(gc.alertLbl, FONT_SM, 0);
+  lv_obj_center(gc.alertLbl);
+  applyCardTheme(idx, STATUS_NONE);
+}
+void updateGaugeCard(int idx, float value, float warnThresh, float critThresh) {
+  GaugeCard& gc = ui.cards[idx];
+  if (!isfinite(value)) {
+    applyCardTheme(idx, STATUS_NONE);
+    if (strcmp(gc.lastText, "--.-") != 0) {
+      strcpy(gc.lastText, "--.-");
+      lv_label_set_text(gc.valLbl, "--.-");
+      lv_obj_align_to(gc.valLbl, gc.arc, LV_ALIGN_CENTER, 0, -4);
+    }
+    setArcAnimated(gc.arc, gc.minRange);
+    return;
+  }
+  int lvl = STATUS_NORMAL;
+  if (value >= critThresh) lvl = STATUS_CRITICAL;
+  else if (value >= warnThresh) lvl = STATUS_WARNING;
+  applyCardTheme(idx, lvl);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.1f", value);
+  if (strcmp(gc.lastText, buf) != 0) {
+    strcpy(gc.lastText, buf);
+    lv_label_set_text(gc.valLbl, buf);
+    lv_obj_align_to(gc.valLbl, gc.arc, LV_ALIGN_CENTER, 0, -4);
+  }
+  int32_t clamped = constrain((int32_t)roundf(value), gc.minRange, gc.maxRange);
+  setArcAnimated(gc.arc, clamped);
+}
+void switchTab(bool showChart) {
+  isChartTab = showChart;
+  if (showChart) {
+    lv_obj_add_flag(ui.pageLive, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(ui.pageChart, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_color(ui.btnTabLive, COL_NONE_BG, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(ui.btnTabLive, 0), COL_MUTED, 0);
+    lv_obj_set_style_bg_color(ui.btnTabChart, themeVal(), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(ui.btnTabChart, 0), COL_BG, 0);
+  } else {
+    lv_obj_add_flag(ui.pageChart, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(ui.pageLive, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_color(ui.btnTabChart, COL_NONE_BG, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(ui.btnTabChart, 0), COL_MUTED, 0);
+    lv_obj_set_style_bg_color(ui.btnTabLive, themeVal(), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(ui.btnTabLive, 0), COL_BG, 0);
+  }
+}
+void updateColorPresetsUI() {
+  for (uint8_t i = 0; i < PRESET_COUNT; i++) {
+    bool match = false;
+    if (COLOR_PRESETS[i].sat == 0 && currentSat == 0) {
+      match = true;
+    } else if (COLOR_PRESETS[i].sat > 0 && currentSat > 0) {
+      int diff = abs((int)currentHue - (int)COLOR_PRESETS[i].hue);
+      if (diff > 180) diff = 360 - diff;
+      if (diff <= 5) match = true;
+    }
+    lv_obj_set_style_border_color(ui.swatchBtns[i], match ? COL_TEXT : COL_BORDER_BASE, 0);
+    lv_obj_set_style_border_width(ui.swatchBtns[i], match ? 2 : 1, 0);
+    if (match) {
+      lv_obj_clear_flag(ui.swatchChecks[i], LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(ui.swatchChecks[i], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+void applyThemePreviewToModal() {
+  lv_color_t bg  = themeBg();
+  lv_color_t brd = themeBorder();
+  lv_color_t val = themeVal();
+  lv_obj_set_style_border_color(ui.brightDlg, brd, 0);
+  lv_obj_set_style_text_color(ui.brightValLbl, val, 0);
+  lv_obj_set_style_bg_color(ui.colorPreview, val, 0);
+  lv_obj_set_style_bg_color(ui.brightSlider, val, LV_PART_INDICATOR);
+  lv_obj_set_style_border_color(ui.brightSlider, val, LV_PART_KNOB);
+  lv_obj_set_style_bg_color(ui.hueSlider, val, LV_PART_KNOB);
+  lv_obj_set_style_bg_color(ui.btnBrightDone, bg, 0);
+  lv_obj_set_style_border_color(ui.btnBrightDone, brd, 0);
+  lv_obj_set_style_text_color(ui.lblBrightDone, val, 0);
+  updateColorPresetsUI();
+}
+void applyThemeToUI() {
+  lv_color_t bg  = themeBg();
+  lv_color_t brd = themeBorder();
+  lv_color_t val = themeVal();
+  // 1. ⌘ Button
+  lv_obj_set_style_bg_color(ui.iconBox, bg, 0);
+  lv_obj_set_style_bg_color(ui.iconBox, brd, LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(ui.iconBox, brd, 0);
+  for (int i = 0; i < 5; i++) {
+    if (ui.iconParts[i]) {
+      lv_obj_set_style_border_color(ui.iconParts[i], val, 0);
+    }
+  }
+  // 2. Tab LIVE / CHART
+  switchTab(isChartTab);
+  // 3. POWER & LCD Button
+  if (powerFeedbackUntil == 0) {
+    setPowerBtnVisual(CMD_IDLE);
+  }
+  if (!lcdSending && lcdFeedbackUntil == 0) {
+    setLcdBtnVisual(CMD_IDLE, uiLcdKnown, uiLcdEnabled);
+  }
+  // 4. PC ONLINE State
+  if (lastConnState == 2) {
+    lv_obj_set_style_bg_color(ui.statusDot, val, 0);
+    lv_obj_set_style_text_color(ui.statusLbl, val, 0);
+  }
+  // 5. Normal
+  for (int i = 0; i < 4; i++) {
+    if (ui.cards[i].currentStatus == STATUS_NORMAL) {
+      ui.cards[i].currentStatus = STATUS_INIT;
+      applyCardTheme(i, STATUS_NORMAL);
+    }
+  }
+  // 6. Power box
+  lv_obj_set_style_border_color(ui.powerDlg, brd, 0);
+  lv_obj_set_style_bg_color(ui.btnPowerConfirm, bg, 0);
+  lv_obj_set_style_border_color(ui.btnPowerConfirm, brd, 0);
+  lv_obj_set_style_text_color(ui.lblPowerConfirm, val, 0);
+  // 7. Setting
+  applyThemePreviewToModal();
+}
+void onTabClick(lv_event_t* e) {
+  bool isChart = (bool)(intptr_t)lv_event_get_user_data(e);
+  Serial.printf("Tab clicked -> %s\n", isChart ? "CHART" : "LIVE");
+  switchTab(isChart);
+}
+void onPowerBtnClick(lv_event_t* e) {
+  Serial.println("Power button clicked");
+  lv_obj_clear_flag(ui.powerModal, LV_OBJ_FLAG_HIDDEN);
+}
+void onPowerCancelClick(lv_event_t* e) {
+  lv_obj_add_flag(ui.powerModal, LV_OBJ_FLAG_HIDDEN);
+}
+void onPowerConfirmClick(lv_event_t* e) {
+  lv_obj_add_flag(ui.powerModal, LV_OBJ_FLAG_HIDDEN);
+  setPowerBtnVisual(CMD_SENDING);
+  powerFeedbackUntil = 0;
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+    sharedData.powerCmdRequested = true;
+    xSemaphoreGive(dataMutex);
+  }
+}
+void onLcdBtnClick(lv_event_t* e) {
+  if (lcdSending) return;
+  bool target = !uiLcdEnabled;
+  Serial.printf("LCD button clicked -> target=%s\n", target ? "ON" : "OFF");
+  lcdSending = true;
+  lcdFeedbackUntil = 0;
+  setLcdBtnVisual(CMD_SENDING, uiLcdKnown, uiLcdEnabled);
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+    sharedData.lcdCmdTarget    = target;
+    sharedData.lcdCmdRequested = true;
+    xSemaphoreGive(dataMutex);
+  }
+}
+void updateBrightnessLabel(uint8_t pct) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%u%%", pct);
+  lv_label_set_text(ui.brightValLbl, buf);
+}
+void onIconClick(lv_event_t* e) {
+  Serial.println("Command icon clicked -> Display & Theme");
+  lv_slider_set_value(ui.brightSlider, currentBrightness, LV_ANIM_OFF);
+  lv_slider_set_value(ui.hueSlider, currentHue, LV_ANIM_OFF);
+  updateBrightnessLabel(currentBrightness);
+  updateColorPresetsUI();
+  lv_obj_clear_flag(ui.brightModal, LV_OBJ_FLAG_HIDDEN);
+}
+void onBrightSliderChanged(lv_event_t* e) {
+  int32_t val = lv_slider_get_value(ui.brightSlider);
+  applyBacklightPwm((uint8_t)val);
+  updateBrightnessLabel((uint8_t)val);
+}
+void onBrightSliderReleased(lv_event_t* e) {
+  prefs.putUChar("bright", currentBrightness);
+  Serial.printf("Brightness saved: %u%%\n", currentBrightness);
+}
+void onHueSliderChanged(lv_event_t* e) {
+  int32_t hue = lv_slider_get_value(ui.hueSlider);
+  currentHue = (uint16_t)constrain(hue, 0, 359);
+  currentSat = 72;
+  applyThemePreviewToModal();
+}
+void onHueSliderReleased(lv_event_t* e) {
+  applyThemeToUI();
+  prefs.putUShort("hue", currentHue);
+  prefs.putUChar("sat", currentSat);
+  Serial.printf("Theme color saved: H=%u S=%u\n", currentHue, currentSat);
+}
+void onPresetClick(lv_event_t* e) {
+  uint8_t idx = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+  if (idx >= PRESET_COUNT) return;
+  currentHue = COLOR_PRESETS[idx].hue;
+  currentSat = COLOR_PRESETS[idx].sat;
+  lv_slider_set_value(ui.hueSlider, currentHue, LV_ANIM_OFF);
+  prefs.putUShort("hue", currentHue);
+  prefs.putUChar("sat", currentSat);
+  Serial.printf("Preset %u selected: H=%u S=%u\n", idx, currentHue, currentSat);
+  applyThemeToUI();
+}
+void onBrightCloseClick(lv_event_t* e) {
+  lv_obj_t* target = lv_event_get_target(e);
+  if (target == ui.brightModal || target == ui.btnBrightDone) {
+    applyThemeToUI();
+    prefs.putUChar("bright", currentBrightness);
+    prefs.putUShort("hue", currentHue);
+    prefs.putUChar("sat", currentSat);
+    lv_obj_add_flag(ui.brightModal, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+// 9. LVGL UI (480 x 320)
+void buildUI() {
+  lv_obj_t* scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, COL_BG, 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+  // A. HEADER BAR (480 x 48) 
+  lv_obj_t* header = lv_obj_create(scr);
+  lv_obj_set_pos(header, 0, 0);
+  lv_obj_set_size(header, 480, 48);
+  lv_obj_set_style_bg_color(header, COL_HEADER, 0);
+  lv_obj_set_style_border_side(header, LV_BORDER_SIDE_BOTTOM, 0);
+  lv_obj_set_style_border_color(header, COL_BORDER_BASE, 0);
+  lv_obj_set_style_border_width(header, 1, 0);
+  lv_obj_set_style_radius(header, 0, 0);
+  lv_obj_set_style_pad_all(header, 0, 0);
+  lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  ui.iconBox = lv_obj_create(header);
+  lv_obj_set_pos(ui.iconBox, 8, 7);
+  lv_obj_set_size(ui.iconBox, 34, 34);
+  lv_obj_set_style_bg_color(ui.iconBox, themeBg(), 0);
+  lv_obj_set_style_bg_color(ui.iconBox, themeBorder(), LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(ui.iconBox, themeBorder(), 0);
+  lv_obj_set_style_border_width(ui.iconBox, 1, 0);
+  lv_obj_set_style_radius(ui.iconBox, 8, 0);
+  lv_obj_set_style_pad_all(ui.iconBox, 0, 0);
+  lv_obj_clear_flag(ui.iconBox, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(ui.iconBox, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(ui.iconBox, 10);
+  lv_obj_add_event_cb(ui.iconBox, onIconClick, LV_EVENT_CLICKED, NULL);
+  drawCommandIcon(ui.iconBox, themeVal(), ui.iconParts);
+  // Tab Switcher (LIVE | CHART)
+  lv_obj_t* tabWrap = lv_obj_create(header);
+  lv_obj_set_pos(tabWrap, 48, 6);
+  lv_obj_set_size(tabWrap, 136, 36);
+  lv_obj_set_style_bg_color(tabWrap, COL_NONE_BG, 0);
+  lv_obj_set_style_border_color(tabWrap, COL_BORDER_BASE, 0);
+  lv_obj_set_style_border_width(tabWrap, 1, 0);
+  lv_obj_set_style_radius(tabWrap, 8, 0);
+  lv_obj_set_style_pad_all(tabWrap, 2, 0);
+  lv_obj_clear_flag(tabWrap, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  ui.btnTabLive = lv_btn_create(tabWrap);
+  lv_obj_set_pos(ui.btnTabLive, 0, 0);
+  lv_obj_set_size(ui.btnTabLive, 64, 30);
+  lv_obj_set_style_radius(ui.btnTabLive, 6, 0);
+  lv_obj_set_style_shadow_width(ui.btnTabLive, 0, 0);
+  lv_obj_set_style_bg_opa(ui.btnTabLive, LV_OPA_70, LV_STATE_PRESSED);
+  lv_obj_set_ext_click_area(ui.btnTabLive, 8);
+  lv_obj_add_event_cb(ui.btnTabLive, onTabClick, LV_EVENT_CLICKED, (void*)(intptr_t)0);
+  lv_obj_t* lblLive = lv_label_create(ui.btnTabLive);
+  lv_label_set_text(lblLive, "LIVE");
+  lv_obj_set_style_text_font(lblLive, FONT_SM, 0);
+  lv_obj_center(lblLive);
+  ui.btnTabChart = lv_btn_create(tabWrap);
+  lv_obj_set_pos(ui.btnTabChart, 66, 0);
+  lv_obj_set_size(ui.btnTabChart, 64, 30);
+  lv_obj_set_style_radius(ui.btnTabChart, 6, 0);
+  lv_obj_set_style_shadow_width(ui.btnTabChart, 0, 0);
+  lv_obj_set_style_bg_opa(ui.btnTabChart, LV_OPA_70, LV_STATE_PRESSED);
+  lv_obj_set_ext_click_area(ui.btnTabChart, 8);
+  lv_obj_add_event_cb(ui.btnTabChart, onTabClick, LV_EVENT_CLICKED, (void*)(intptr_t)1);
+  lv_obj_t* lblChart = lv_label_create(ui.btnTabChart);
+  lv_label_set_text(lblChart, "CHART");
+  lv_obj_set_style_text_font(lblChart, FONT_SM, 0);
+  lv_obj_center(lblChart);
+  // POWER BUTTON 
+  ui.btnPower = lv_btn_create(header);
+  lv_obj_set_pos(ui.btnPower, 190, 6);
+  lv_obj_set_size(ui.btnPower, 96, 36);
+  lv_obj_set_style_radius(ui.btnPower, 7, 0);
+  lv_obj_set_style_border_width(ui.btnPower, 1, 0);
+  lv_obj_set_style_shadow_width(ui.btnPower, 0, 0);
+  lv_obj_set_style_bg_opa(ui.btnPower, LV_OPA_70, LV_STATE_PRESSED);
+  lv_obj_set_ext_click_area(ui.btnPower, 6);
+  lv_obj_add_event_cb(ui.btnPower, onPowerBtnClick, LV_EVENT_CLICKED, NULL);
+  ui.btnPowerLbl = lv_label_create(ui.btnPower);
+  lv_obj_set_style_text_font(ui.btnPowerLbl, FONT_SM, 0);
+  lv_obj_center(ui.btnPowerLbl);
+  setPowerBtnVisual(CMD_IDLE);
+  // LCD BUTTON
+  ui.btnLcd = lv_btn_create(header);
+  lv_obj_set_pos(ui.btnLcd, 292, 6);
+  lv_obj_set_size(ui.btnLcd, 66, 36);
+  lv_obj_set_style_radius(ui.btnLcd, 7, 0);
+  lv_obj_set_style_border_width(ui.btnLcd, 1, 0);
+  lv_obj_set_style_shadow_width(ui.btnLcd, 0, 0);
+  lv_obj_set_style_bg_opa(ui.btnLcd, LV_OPA_70, LV_STATE_PRESSED);
+  lv_obj_set_ext_click_area(ui.btnLcd, 6);
+  lv_obj_add_event_cb(ui.btnLcd, onLcdBtnClick, LV_EVENT_CLICKED, NULL);
+  ui.btnLcdLbl = lv_label_create(ui.btnLcd);
+  lv_label_set_text(ui.btnLcdLbl, "LCD");
+  lv_obj_set_style_text_font(ui.btnLcdLbl, FONT_SM, 0);
+  lv_obj_center(ui.btnLcdLbl);
+  setLcdBtnVisual(CMD_IDLE, false, true);
+  // Status Indicator and clock
+  ui.statusDot = lv_obj_create(header);
+  lv_obj_set_size(ui.statusDot, 7, 7);
+  lv_obj_set_pos(ui.statusDot, 368, 12);
+  lv_obj_set_style_radius(ui.statusDot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(ui.statusDot, COL_CRIT_VAL, 0);
+  lv_obj_set_style_border_width(ui.statusDot, 0, 0);
+  lv_obj_clear_flag(ui.statusDot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  ui.statusLbl = lv_label_create(header);
+  lv_label_set_text(ui.statusLbl, "MCU OFFLINE");
+  lv_obj_set_style_text_font(ui.statusLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(ui.statusLbl, COL_CRIT_VAL, 0);
+  lv_obj_set_pos(ui.statusLbl, 380, 9);
+  ui.clockLbl = lv_label_create(header);
+  lv_label_set_text(ui.clockLbl, "--:--:--");
+  lv_obj_set_style_text_font(ui.clockLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(ui.clockLbl, COL_TEXT, 0);
+  lv_obj_set_pos(ui.clockLbl, 380, 26);
+  // B. PAGE 1: 4 GAUGES
+  ui.pageLive = lv_obj_create(scr);
+  lv_obj_set_pos(ui.pageLive, 0, 48);
+  lv_obj_set_size(ui.pageLive, 480, 272);
+  lv_obj_set_style_bg_opa(ui.pageLive, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(ui.pageLive, 0, 0);
+  lv_obj_set_style_pad_all(ui.pageLive, 0, 0);
+  lv_obj_clear_flag(ui.pageLive, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  createGaugeCard(ui.pageLive, CARD_CPU,   10,   7, 225, 123, "CPU Temperature",  "°C", 20,  100);
+  createGaugeCard(ui.pageLive, CARD_GPU,  245,   7, 225, 123, "GPU Temperature",  "°C", 20,  100);
+  createGaugeCard(ui.pageLive, CARD_CASE,  10, 139, 225, 123, "Case Temperature", "°C", 15,   65);
+  createGaugeCard(ui.pageLive, CARD_PWR,  245, 139, 225, 123, "PC Power",         "W",   0, 1000);
+  // C. PAGE 2: HISTORY CHART
+  ui.pageChart = lv_obj_create(scr);
+  lv_obj_set_pos(ui.pageChart, 0, 48);
+  lv_obj_set_size(ui.pageChart, 480, 272);
+  lv_obj_set_style_bg_opa(ui.pageChart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(ui.pageChart, 0, 0);
+  lv_obj_set_style_pad_all(ui.pageChart, 0, 0);
+  lv_obj_clear_flag(ui.pageChart, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t* chartCard = lv_obj_create(ui.pageChart);
+  lv_obj_set_pos(chartCard, 10, 7);
+  lv_obj_set_size(chartCard, 460, 255);
+  lv_obj_set_style_bg_color(chartCard, COL_NONE_BG, 0);
+  lv_obj_set_style_border_color(chartCard, COL_BORDER_BASE, 0);
+  lv_obj_set_style_border_width(chartCard, 1, 0);
+  lv_obj_set_style_radius(chartCard, 12, 0);
+  lv_obj_set_style_pad_all(chartCard, 0, 0);
+  lv_obj_clear_flag(chartCard, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  ui.legCpuLbl = lv_label_create(chartCard);
+  lv_label_set_text(ui.legCpuLbl, "CPU: --.-°C");
+  lv_obj_set_style_text_font(ui.legCpuLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(ui.legCpuLbl, COL_LINE_CPU, 0);
+  lv_obj_set_pos(ui.legCpuLbl, 16, 12);
+  ui.legGpuLbl = lv_label_create(chartCard);
+  lv_label_set_text(ui.legGpuLbl, "GPU: --.-°C");
+  lv_obj_set_style_text_font(ui.legGpuLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(ui.legGpuLbl, COL_LINE_GPU, 0);
+  lv_obj_set_pos(ui.legGpuLbl, 130, 12);
+  ui.legCaseLbl = lv_label_create(chartCard);
+  lv_label_set_text(ui.legCaseLbl, "Case: --.-°C");
+  lv_obj_set_style_text_font(ui.legCaseLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(ui.legCaseLbl, COL_LINE_CASE, 0);
+  lv_obj_set_pos(ui.legCaseLbl, 244, 12);
+  lv_obj_t* spanLbl = lv_label_create(chartCard);
+  lv_label_set_text(spanLbl, "60s");
+  lv_obj_set_style_text_font(spanLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(spanLbl, COL_MUTED, 0);
+  lv_obj_align(spanLbl, LV_ALIGN_TOP_RIGHT, -14, 12);
+  ui.chart = lv_chart_create(chartCard);
+  lv_obj_set_pos(ui.chart, 42, 36);
+  lv_obj_set_size(ui.chart, 404, 205);
+  lv_chart_set_type(ui.chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(ui.chart, 60);
+  lv_chart_set_range(ui.chart, LV_CHART_AXIS_PRIMARY_Y, 20, 100);
+  lv_chart_set_div_line_count(ui.chart, 5, 6);
+  lv_chart_set_axis_tick(ui.chart, LV_CHART_AXIS_PRIMARY_Y, 5, 2, 5, 2, true, 36);
+  lv_chart_set_update_mode(ui.chart, LV_CHART_UPDATE_MODE_SHIFT);
+  lv_obj_clear_flag(ui.chart, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(ui.chart, COL_BG, 0);
+  lv_obj_set_style_border_color(ui.chart, COL_BORDER_BASE, 0);
+  lv_obj_set_style_line_color(ui.chart, lv_color_hex(0x131C2B), LV_PART_MAIN);
+  lv_obj_set_style_text_color(ui.chart, COL_MUTED, LV_PART_TICKS);
+  lv_obj_set_style_text_font(ui.chart, FONT_SM, LV_PART_TICKS);
+  lv_obj_set_style_size(ui.chart, 0, LV_PART_INDICATOR);
+  lv_obj_set_style_line_width(ui.chart, 2, LV_PART_ITEMS);
+  ui.serCpu  = lv_chart_add_series(ui.chart, COL_LINE_CPU, LV_CHART_AXIS_PRIMARY_Y);
+  ui.serGpu  = lv_chart_add_series(ui.chart, COL_LINE_GPU, LV_CHART_AXIS_PRIMARY_Y);
+  ui.serCase = lv_chart_add_series(ui.chart, COL_LINE_CASE, LV_CHART_AXIS_PRIMARY_Y);
+  // D. MODAL CONFIRMS ON/OFF PC
+  ui.powerModal = lv_obj_create(scr);
+  lv_obj_set_pos(ui.powerModal, 0, 0);
+  lv_obj_set_size(ui.powerModal, 480, 320);
+  lv_obj_set_style_bg_color(ui.powerModal, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(ui.powerModal, LV_OPA_70, 0);
+  lv_obj_set_style_border_width(ui.powerModal, 0, 0);
+  lv_obj_set_style_radius(ui.powerModal, 0, 0);
+  lv_obj_clear_flag(ui.powerModal, LV_OBJ_FLAG_SCROLLABLE);
+  ui.powerDlg = lv_obj_create(ui.powerModal);
+  lv_obj_set_size(ui.powerDlg, 300, 152);
+  lv_obj_center(ui.powerDlg);
+  lv_obj_set_style_bg_color(ui.powerDlg, COL_NONE_BG, 0);
+  lv_obj_set_style_border_color(ui.powerDlg, themeBorder(), 0);
+  lv_obj_set_style_border_width(ui.powerDlg, 1, 0);
+  lv_obj_set_style_radius(ui.powerDlg, 14, 0);
+  lv_obj_set_style_pad_all(ui.powerDlg, 0, 0);
+  lv_obj_clear_flag(ui.powerDlg, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* dlgTitle = lv_label_create(ui.powerDlg);
+  lv_label_set_text(dlgTitle, LV_SYMBOL_POWER "  PC POWER CONTROL");
+  lv_obj_set_style_text_font(dlgTitle, FONT_TITLE, 0);
+  lv_obj_set_style_text_color(dlgTitle, COL_TEXT, 0);
+  lv_obj_align(dlgTitle, LV_ALIGN_TOP_MID, 0, 18);
+  lv_obj_t* dlgMsg = lv_label_create(ui.powerDlg);
+  lv_label_set_text(dlgMsg, "Trigger POWER BUTTON?");
+  lv_obj_set_style_text_font(dlgMsg, FONT_SM, 0);
+  lv_obj_set_style_text_color(dlgMsg, COL_MUTED, 0);
+  lv_obj_align(dlgMsg, LV_ALIGN_TOP_MID, 0, 50);
+  lv_obj_t* btnCancel = lv_btn_create(ui.powerDlg);
+  lv_obj_set_pos(btnCancel, 20, 88);
+  lv_obj_set_size(btnCancel, 120, 44);
+  lv_obj_set_style_bg_color(btnCancel, COL_BG, 0);
+  lv_obj_set_style_bg_opa(btnCancel, LV_OPA_70, LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(btnCancel, COL_BORDER_BASE, 0);
+  lv_obj_set_style_border_width(btnCancel, 1, 0);
+  lv_obj_set_style_radius(btnCancel, 8, 0);
+  lv_obj_set_style_shadow_width(btnCancel, 0, 0);
+  lv_obj_set_ext_click_area(btnCancel, 6);
+  lv_obj_add_event_cb(btnCancel, onPowerCancelClick, LV_EVENT_CLICKED, NULL);
+  lv_obj_t* lblCancel = lv_label_create(btnCancel);
+  lv_label_set_text(lblCancel, "CANCEL");
+  lv_obj_set_style_text_font(lblCancel, FONT_CARD, 0);
+  lv_obj_set_style_text_color(lblCancel, COL_MUTED, 0);
+  lv_obj_center(lblCancel);
+  ui.btnPowerConfirm = lv_btn_create(ui.powerDlg);
+  lv_obj_set_pos(ui.btnPowerConfirm, 160, 88);
+  lv_obj_set_size(ui.btnPowerConfirm, 120, 44);
+  lv_obj_set_style_bg_color(ui.btnPowerConfirm, themeBg(), 0);
+  lv_obj_set_style_bg_opa(ui.btnPowerConfirm, LV_OPA_70, LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(ui.btnPowerConfirm, themeBorder(), 0);
+  lv_obj_set_style_border_width(ui.btnPowerConfirm, 1, 0);
+  lv_obj_set_style_radius(ui.btnPowerConfirm, 8, 0);
+  lv_obj_set_style_shadow_width(ui.btnPowerConfirm, 0, 0);
+  lv_obj_set_ext_click_area(ui.btnPowerConfirm, 6);
+  lv_obj_add_event_cb(ui.btnPowerConfirm, onPowerConfirmClick, LV_EVENT_CLICKED, NULL);
+  ui.lblPowerConfirm = lv_label_create(ui.btnPowerConfirm);
+  lv_label_set_text(ui.lblPowerConfirm, "PRESS");
+  lv_obj_set_style_text_font(ui.lblPowerConfirm, FONT_CARD, 0);
+  lv_obj_set_style_text_color(ui.lblPowerConfirm, themeVal(), 0);
+  lv_obj_center(ui.lblPowerConfirm);
+  lv_obj_add_flag(ui.powerModal, LV_OBJ_FLAG_HIDDEN);
+  // D2. MODAL ADJUSTS BRIGHTNES & COLORS
+  ui.brightModal = lv_obj_create(scr);
+  lv_obj_set_pos(ui.brightModal, 0, 0);
+  lv_obj_set_size(ui.brightModal, 480, 320);
+  lv_obj_set_style_bg_color(ui.brightModal, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(ui.brightModal, LV_OPA_70, 0);
+  lv_obj_set_style_border_width(ui.brightModal, 0, 0);
+  lv_obj_set_style_radius(ui.brightModal, 0, 0);
+  lv_obj_clear_flag(ui.brightModal, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(ui.brightModal, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(ui.brightModal, onBrightCloseClick, LV_EVENT_CLICKED, NULL);
+  ui.brightDlg = lv_obj_create(ui.brightModal);
+  lv_obj_set_size(ui.brightDlg, 360, 256);
+  lv_obj_center(ui.brightDlg);
+  lv_obj_set_style_bg_color(ui.brightDlg, COL_NONE_BG, 0);
+  lv_obj_set_style_border_color(ui.brightDlg, themeBorder(), 0);
+  lv_obj_set_style_border_width(ui.brightDlg, 1, 0);
+  lv_obj_set_style_radius(ui.brightDlg, 14, 0);
+  lv_obj_set_style_pad_all(ui.brightDlg, 0, 0);
+  lv_obj_clear_flag(ui.brightDlg, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* bTitle = lv_label_create(ui.brightDlg);
+  lv_label_set_text(bTitle, LV_SYMBOL_SETTINGS "  DISPLAY & THEME");
+  lv_obj_set_style_text_font(bTitle, FONT_TITLE, 0);
+  lv_obj_set_style_text_color(bTitle, COL_TEXT, 0);
+  lv_obj_align(bTitle, LV_ALIGN_TOP_MID, 0, 12);
+  // BRIGHTNESS
+  lv_obj_t* bLbl = lv_label_create(ui.brightDlg);
+  lv_label_set_text(bLbl, "Brightness");
+  lv_obj_set_style_text_font(bLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(bLbl, COL_MUTED, 0);
+  lv_obj_set_pos(bLbl, 20, 40);
+  ui.brightValLbl = lv_label_create(ui.brightDlg);
+  lv_label_set_text(ui.brightValLbl, "100%");
+  lv_obj_set_style_text_font(ui.brightValLbl, FONT_CARD, 0);
+  lv_obj_set_style_text_color(ui.brightValLbl, themeVal(), 0);
+  lv_obj_align(ui.brightValLbl, LV_ALIGN_TOP_RIGHT, -20, 38);
+  ui.brightSlider = lv_slider_create(ui.brightDlg);
+  lv_obj_set_size(ui.brightSlider, 320, 16);
+  lv_obj_align(ui.brightSlider, LV_ALIGN_TOP_MID, 0, 62);
+  lv_slider_set_range(ui.brightSlider, 5, 100);
+  lv_slider_set_value(ui.brightSlider, currentBrightness, LV_ANIM_OFF);
+  lv_obj_set_ext_click_area(ui.brightSlider, 14);
+  lv_obj_set_style_bg_color(ui.brightSlider, COL_BG, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(ui.brightSlider, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(ui.brightSlider, COL_BORDER_BASE, LV_PART_MAIN);
+  lv_obj_set_style_border_width(ui.brightSlider, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(ui.brightSlider, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(ui.brightSlider, themeVal(), LV_PART_INDICATOR);
+  lv_obj_set_style_radius(ui.brightSlider, 8, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(ui.brightSlider, COL_TEXT, LV_PART_KNOB);
+  lv_obj_set_style_border_color(ui.brightSlider, themeVal(), LV_PART_KNOB);
+  lv_obj_set_style_border_width(ui.brightSlider, 2, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(ui.brightSlider, 5, LV_PART_KNOB);
+  lv_obj_add_event_cb(ui.brightSlider, onBrightSliderChanged, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_add_event_cb(ui.brightSlider, onBrightSliderReleased, LV_EVENT_RELEASED, NULL);
+  // COLOR
+  lv_obj_t* cLbl = lv_label_create(ui.brightDlg);
+  lv_label_set_text(cLbl, "Theme Color");
+  lv_obj_set_style_text_font(cLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(cLbl, COL_MUTED, 0);
+  lv_obj_set_pos(cLbl, 20, 90);
+  ui.colorPreview = lv_obj_create(ui.brightDlg);
+  lv_obj_set_size(ui.colorPreview, 42, 14);
+  lv_obj_align(ui.colorPreview, LV_ALIGN_TOP_RIGHT, -20, 90);
+  lv_obj_set_style_bg_color(ui.colorPreview, themeVal(), 0);
+  lv_obj_set_style_border_color(ui.colorPreview, COL_TEXT, 0);
+  lv_obj_set_style_border_width(ui.colorPreview, 1, 0);
+  lv_obj_set_style_radius(ui.colorPreview, 5, 0);
+  lv_obj_clear_flag(ui.colorPreview, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t* rainbowBg = lv_obj_create(ui.brightDlg);
+  lv_obj_set_size(rainbowBg, 320, 18);
+  lv_obj_align(rainbowBg, LV_ALIGN_TOP_MID, 0, 112);
+  lv_obj_set_style_radius(rainbowBg, 9, 0);
+  lv_obj_set_style_border_color(rainbowBg, COL_BORDER_BASE, 0);
+  lv_obj_set_style_border_width(rainbowBg, 1, 0);
+  lv_obj_set_style_pad_all(rainbowBg, 0, 0);
+  lv_obj_set_style_clip_corner(rainbowBg, true, 0);
+  lv_obj_clear_flag(rainbowBg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  for (int i = 0; i < 16; i++) {
+    lv_obj_t* seg = lv_obj_create(rainbowBg);
+    lv_obj_set_pos(seg, i * 20, 0);
+    lv_obj_set_size(seg, 20, 18);
+    lv_obj_set_style_bg_color(seg, lv_color_hsv_to_rgb((i * 360) / 16, 85, 95), 0);
+    lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(seg, 0, 0);
+    lv_obj_set_style_radius(seg, 0, 0);
+    lv_obj_set_style_pad_all(seg, 0, 0);
+    lv_obj_clear_flag(seg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  }
+  ui.hueSlider = lv_slider_create(ui.brightDlg);
+  lv_obj_set_size(ui.hueSlider, 320, 18);
+  lv_obj_align(ui.hueSlider, LV_ALIGN_TOP_MID, 0, 112);
+  lv_slider_set_range(ui.hueSlider, 0, 359);
+  lv_slider_set_value(ui.hueSlider, currentHue, LV_ANIM_OFF);
+  lv_obj_set_ext_click_area(ui.hueSlider, 14);
+  lv_obj_set_style_bg_opa(ui.hueSlider, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(ui.hueSlider, LV_OPA_TRANSP, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(ui.hueSlider, themeVal(), LV_PART_KNOB);
+  lv_obj_set_style_border_color(ui.hueSlider, COL_TEXT, LV_PART_KNOB);
+  lv_obj_set_style_border_width(ui.hueSlider, 2, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(ui.hueSlider, 5, LV_PART_KNOB);
+  lv_obj_add_event_cb(ui.hueSlider, onHueSliderChanged, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_add_event_cb(ui.hueSlider, onHueSliderReleased, LV_EVENT_RELEASED, NULL);
+  // 8-color
+  for (uint8_t i = 0; i < PRESET_COUNT; i++) {
+    ui.swatchBtns[i] = lv_btn_create(ui.brightDlg);
+    lv_obj_set_pos(ui.swatchBtns[i], 20 + i * 41, 148);
+    lv_obj_set_size(ui.swatchBtns[i], 33, 33);
+    lv_color_t swCol = lv_color_hsv_to_rgb(COLOR_PRESETS[i].hue, COLOR_PRESETS[i].sat, 92);
+    lv_obj_set_style_bg_color(ui.swatchBtns[i], swCol, 0);
+    lv_obj_set_style_bg_opa(ui.swatchBtns[i], LV_OPA_70, LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ui.swatchBtns[i], 8, 0);
+    lv_obj_set_style_shadow_width(ui.swatchBtns[i], 0, 0);
+    lv_obj_set_ext_click_area(ui.swatchBtns[i], 6);
+    lv_obj_add_event_cb(ui.swatchBtns[i], onPresetClick, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    ui.swatchChecks[i] = lv_label_create(ui.swatchBtns[i]);
+    lv_label_set_text(ui.swatchChecks[i], LV_SYMBOL_OK);
+    lv_obj_set_style_text_font(ui.swatchChecks[i], FONT_SM, 0);
+    lv_obj_set_style_text_color(ui.swatchChecks[i], COL_BG, 0);
+    lv_obj_center(ui.swatchChecks[i]);
+  }
+  updateColorPresetsUI();
+  ui.btnBrightDone = lv_btn_create(ui.brightDlg);
+  lv_obj_set_size(ui.btnBrightDone, 140, 40);
+  lv_obj_align(ui.btnBrightDone, LV_ALIGN_BOTTOM_MID, 0, -14);
+  lv_obj_set_style_bg_color(ui.btnBrightDone, themeBg(), 0);
+  lv_obj_set_style_bg_opa(ui.btnBrightDone, LV_OPA_70, LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(ui.btnBrightDone, themeBorder(), 0);
+  lv_obj_set_style_border_width(ui.btnBrightDone, 1, 0);
+  lv_obj_set_style_radius(ui.btnBrightDone, 8, 0);
+  lv_obj_set_style_shadow_width(ui.btnBrightDone, 0, 0);
+  lv_obj_set_ext_click_area(ui.btnBrightDone, 8);
+  lv_obj_add_event_cb(ui.btnBrightDone, onBrightCloseClick, LV_EVENT_CLICKED, NULL);
+  ui.lblBrightDone = lv_label_create(ui.btnBrightDone);
+  lv_label_set_text(ui.lblBrightDone, "DONE");
+  lv_obj_set_style_text_font(ui.lblBrightDone, FONT_CARD, 0);
+  lv_obj_set_style_text_color(ui.lblBrightDone, themeVal(), 0);
+  lv_obj_center(ui.lblBrightDone);
+  lv_obj_add_flag(ui.brightModal, LV_OBJ_FLAG_HIDDEN);
+  // E. SPLASH SCREEN
+  ui.pageSplash = lv_obj_create(scr);
+  lv_obj_set_pos(ui.pageSplash, 0, 0);
+  lv_obj_set_size(ui.pageSplash, 480, 320);
+  lv_obj_set_style_bg_color(ui.pageSplash, COL_BG, 0);
+  lv_obj_set_style_bg_opa(ui.pageSplash, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ui.pageSplash, 0, 0);
+  lv_obj_set_style_radius(ui.pageSplash, 0, 0);
+  lv_obj_set_style_pad_all(ui.pageSplash, 0, 0);
+  lv_obj_clear_flag(ui.pageSplash, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_t* bootIconBox = lv_obj_create(ui.pageSplash);
+  lv_obj_set_size(bootIconBox, 48, 48);
+  lv_obj_align(bootIconBox, LV_ALIGN_CENTER, 0, -56);
+  lv_obj_set_style_bg_color(bootIconBox, themeBg(), 0);
+  lv_obj_set_style_border_color(bootIconBox, themeBorder(), 0);
+  lv_obj_set_style_border_width(bootIconBox, 1, 0);
+  lv_obj_set_style_radius(bootIconBox, 12, 0);
+  lv_obj_set_style_pad_all(bootIconBox, 0, 0);
+  lv_obj_clear_flag(bootIconBox, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  drawCommandIconLarge(bootIconBox, themeVal());
+  lv_obj_t* bootTitle = lv_label_create(ui.pageSplash);
+  lv_label_set_text(bootTitle, "RePOS");
+  lv_obj_set_style_text_font(bootTitle, FONT_BOOT, 0);
+  lv_obj_set_style_text_color(bootTitle, COL_TEXT, 0);
+  lv_obj_align(bootTitle, LV_ALIGN_CENTER, 0, -4);
+  lv_obj_t* bootSub = lv_label_create(ui.pageSplash);
+  lv_label_set_text(bootSub, "REMOTE PC & SCADA MONITOR");
+  lv_obj_set_style_text_font(bootSub, FONT_SM, 0);
+  lv_obj_set_style_text_color(bootSub, COL_MUTED, 0);
+  lv_obj_align(bootSub, LV_ALIGN_CENTER, 0, 22);
+  ui.bootBar = lv_bar_create(ui.pageSplash);
+  lv_obj_set_size(ui.bootBar, 280, 8);
+  lv_obj_align(ui.bootBar, LV_ALIGN_CENTER, 0, 56);
+  lv_bar_set_range(ui.bootBar, 0, 100);
+  lv_bar_set_value(ui.bootBar, 5, LV_ANIM_OFF);
+  lv_obj_set_style_anim_time(ui.bootBar, 220, 0);
+  lv_obj_set_style_bg_color(ui.bootBar, COL_NONE_BG, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(ui.bootBar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(ui.bootBar, COL_BORDER_BASE, LV_PART_MAIN);
+  lv_obj_set_style_border_width(ui.bootBar, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(ui.bootBar, 4, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(ui.bootBar, themeVal(), LV_PART_INDICATOR);
+  lv_obj_set_style_radius(ui.bootBar, 4, LV_PART_INDICATOR);
+  lv_obj_clear_flag(ui.bootBar, LV_OBJ_FLAG_CLICKABLE);
+  ui.bootStatusLbl = lv_label_create(ui.pageSplash);
+  lv_label_set_text(ui.bootStatusLbl, "Initializing system...");
+  lv_obj_set_style_text_font(ui.bootStatusLbl, FONT_SM, 0);
+  lv_obj_set_style_text_color(ui.bootStatusLbl, COL_MUTED, 0);
+  lv_obj_align(ui.bootStatusLbl, LV_ALIGN_CENTER, 0, 78);
+  switchTab(false);
+}
+// 10. CẬP NHẬT SPLASH, ĐỒNG HỒ & UI CHÍNH
+void updateSplash() {
+  if (bootDone) return;
+  bool wifiOk = false;
+  bool mcuOk  = false;
+  if (xSemaphoreTake(dataMutex, 0) == pdTRUE) {
+    wifiOk = sharedData.wifiConnected;
+    mcuOk  = sharedData.mcuOnline;
+    xSemaphoreGive(dataMutex);
+  }
+  uint32_t now     = millis();
+  uint32_t elapsed = now - bootStartMs;
+  int stage = 0;
+  int32_t pct = 10;
+  if (mcuOk) {
+    stage = 3;
+    pct = 100;
+    if (bootCompleteMs == 0) bootCompleteMs = now;
+  } else if (elapsed >= BOOT_TIMEOUT_MS) {
+    stage = 2;
+    pct = 100;
+    if (bootCompleteMs == 0) bootCompleteMs = now;
+  } else if (wifiOk) {
+    stage = 1;
+    pct = min(88, 45 + (int)(elapsed / 120));
+  } else {
+    stage = 0;
+    pct = min(40, 10 + (int)(elapsed / 140));
+  }
+  if (pct != lastBootPct) {
+    lastBootPct = pct;
+    lv_bar_set_value(ui.bootBar, pct, LV_ANIM_ON);
+  }
+  if (stage != lastBootStage) {
+    lastBootStage = stage;
+    if (stage == 3) {
+      lv_label_set_text(ui.bootStatusLbl, "Connected! Launching dashboard...");
+      lv_obj_set_style_text_color(ui.bootStatusLbl, themeVal(), 0);
+    } else if (stage == 2) {
+      lv_label_set_text(ui.bootStatusLbl, "Offline mode - Entering dashboard...");
+      lv_obj_set_style_text_color(ui.bootStatusLbl, COL_WARN_VAL, 0);
+    } else if (stage == 1) {
+      lv_label_set_text(ui.bootStatusLbl, "Connecting to 192.168.1.115...");
+    } else {
+      lv_label_set_text(ui.bootStatusLbl, "Connecting to Wi-Fi...");
+    }
+  }
+  if (bootCompleteMs != 0 && (now - bootCompleteMs >= 350)) {
+    lv_obj_add_flag(ui.pageSplash, LV_OBJ_FLAG_HIDDEN);
+    bootDone = true;
+    gaugeSweepAtMs = now + 60;
+  }
+}
+void updateClock() {
+  if (!bootDone) return;
+  if (!lv_obj_has_flag(ui.powerModal, LV_OBJ_FLAG_HIDDEN) ||
+      !lv_obj_has_flag(ui.brightModal, LV_OBJ_FLAG_HIDDEN)) {
+    return;
+  }
+  time_t nowSec = time(nullptr);
+  if (nowSec <= 1700000000) return;
+  if (nowSec == lastClockSec) return;
+  lastClockSec = nowSec;
+  struct tm tmInfo;
+  localtime_r(&nowSec, &tmInfo);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+           tmInfo.tm_hour, tmInfo.tm_min, tmInfo.tm_sec);
+  lv_label_set_text(ui.clockLbl, buf);
+}
+void updateUI() {
+  uint32_t now = millis();
+  if (gaugeSweepAtMs != 0 && now >= gaugeSweepAtMs) {
+    gaugeSweepAtMs = 0;
+    lastRenderedSeq = 0;
+  }
+  if (powerFeedbackUntil != 0 && now >= powerFeedbackUntil) {
+    powerFeedbackUntil = 0;
+    setPowerBtnVisual(CMD_IDLE);
+  }
+  if (lcdFeedbackUntil != 0 && now >= lcdFeedbackUntil) {
+    lcdFeedbackUntil = 0;
+    if (!lcdSending) {
+      setLcdBtnVisual(CMD_IDLE, uiLcdKnown, uiLcdEnabled);
+    }
+  }
+  if (!lv_obj_has_flag(ui.powerModal, LV_OBJ_FLAG_HIDDEN) ||
+      !lv_obj_has_flag(ui.brightModal, LV_OBJ_FLAG_HIDDEN)) {
+    return;
+  }
+  TelemetryData snap;
+  bool sensorChanged = false;
+  bool powerChanged  = false;
+  bool lcdChanged    = false;
+  bool lcdCmdChanged = false;
+  if (xSemaphoreTake(dataMutex, 0) != pdTRUE) return;
+  if (sharedData.sampleSeq != lastRenderedSeq) {
+    sensorChanged = true;
+    lastRenderedSeq = sharedData.sampleSeq;
+  }
+  if (sharedData.powerCmdSeq != lastPowerSeq) {
+    powerChanged = true;
+    lastPowerSeq = sharedData.powerCmdSeq;
+  }
+  if (sharedData.lcdSeq != lastLcdSeq) {
+    lcdChanged = true;
+    lastLcdSeq = sharedData.lcdSeq;
+  }
+  if (sharedData.lcdCmdSeq != lastLcdCmdSeq) {
+    lcdCmdChanged = true;
+    lastLcdCmdSeq = sharedData.lcdCmdSeq;
+  }
+  if (sensorChanged || powerChanged || lcdChanged || lcdCmdChanged) {
+    snap = sharedData;
+  }
+  xSemaphoreGive(dataMutex);
+  if (powerChanged) {
+    setPowerBtnVisual(snap.powerCmdResult);
+    powerFeedbackUntil = now + 1800;
+  }
+  if (lcdChanged) {
+    uiLcdKnown   = snap.lcdKnown;
+    uiLcdEnabled = snap.lcdEnabled;
+    if (!lcdSending && lcdFeedbackUntil == 0) {
+      setLcdBtnVisual(CMD_IDLE, uiLcdKnown, uiLcdEnabled);
+    }
+  }
+  if (lcdCmdChanged) {
+    lcdSending   = false;
+    uiLcdKnown   = snap.lcdKnown;
+    uiLcdEnabled = snap.lcdEnabled;
+    if (snap.lcdCmdResult == CMD_ERR) {
+      setLcdBtnVisual(CMD_ERR, uiLcdKnown, uiLcdEnabled);
+      lcdFeedbackUntil = now + 2500;
+    } else {
+      lcdFeedbackUntil = 0;
+      setLcdBtnVisual(CMD_IDLE, uiLcdKnown, uiLcdEnabled);
+    }
+  }
+  if (!sensorChanged) return;
+  int connState = (snap.mcuOnline && snap.pcOnline) ? 2 : (snap.mcuOnline ? 1 : 0);
+  if (connState != lastConnState) {
+    lastConnState = connState;
+    if (connState == 2) {
+      lv_obj_set_style_bg_color(ui.statusDot, themeVal(), 0);
+      lv_obj_set_style_text_color(ui.statusLbl, themeVal(), 0);
+      lv_label_set_text(ui.statusLbl, "PC ONLINE");
+    } else if (connState == 1) {
+      lv_obj_set_style_bg_color(ui.statusDot, COL_WARN_VAL, 0);
+      lv_obj_set_style_text_color(ui.statusLbl, COL_WARN_VAL, 0);
+      lv_label_set_text(ui.statusLbl, "PC OFFLINE");
+    } else {
+      lv_obj_set_style_bg_color(ui.statusDot, COL_CRIT_VAL, 0);
+      lv_obj_set_style_text_color(ui.statusLbl, COL_CRIT_VAL, 0);
+      lv_label_set_text(ui.statusLbl, "MCU OFFLINE");
+    }
+  }
+  if (bootDone) {
+    updateGaugeCard(CARD_CPU,  snap.cpuTemp,  TEMP_YELLOW,    TEMP_RED);
+    updateGaugeCard(CARD_GPU,  snap.gpuTemp,  TEMP_YELLOW,    TEMP_RED);
+    updateGaugeCard(CARD_CASE, snap.caseTemp, AMBIENT_YELLOW, AMBIENT_RED);
+    updateGaugeCard(CARD_PWR,  snap.pcPower,  POWER_YELLOW,   POWER_RED);
+  }
+  char buf[32];
+  if (isfinite(snap.cpuTemp)) {
+    snprintf(buf, sizeof(buf), "CPU: %.1f°C", snap.cpuTemp);
+    lv_label_set_text(ui.legCpuLbl, buf);
+    lv_chart_set_next_value(ui.chart, ui.serCpu, (lv_coord_t)roundf(snap.cpuTemp));
+  }
+  if (isfinite(snap.gpuTemp)) {
+    snprintf(buf, sizeof(buf), "GPU: %.1f°C", snap.gpuTemp);
+    lv_label_set_text(ui.legGpuLbl, buf);
+    lv_chart_set_next_value(ui.chart, ui.serGpu, (lv_coord_t)roundf(snap.gpuTemp));
+  }
+  if (isfinite(snap.caseTemp)) {
+    snprintf(buf, sizeof(buf), "Case: %.1f°C", snap.caseTemp);
+    lv_label_set_text(ui.legCaseLbl, buf);
+    lv_chart_set_next_value(ui.chart, ui.serCase, (lv_coord_t)roundf(snap.caseTemp));
+  }
+}
+// 11. SETUP & LOOP
+void setup() {
+  Serial.begin(115200);
+  prefs.begin("repos_cfg", false);
+  currentBrightness = constrain((int)prefs.getUChar("bright", 100), 5, 100);
+  currentHue        = prefs.getUShort("hue", 142) % 360;
+  currentSat        = prefs.getUChar("sat", 70);
+  if (currentSat > 100) currentSat = 70;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(BACKLIGHT_PIN, 5000, 8);
+#else
+  ledcSetup(0, 5000, 8);
+  ledcAttachPin(BACKLIGHT_PIN, 0);
+#endif
+  applyBacklightPwm(currentBrightness);
+  lcd.init();
+  lcd.setRotation(3);
+  lv_init();
+  size_t bufPixels = 480 * 40;
+  buf1 = (lv_color_t*)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_DMA);
+  buf2 = (lv_color_t*)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_DMA);
+  if (!buf1 || !buf2) {
+    if (buf1) free(buf1);
+    if (buf2) free(buf2);
+    bufPixels = 480 * 24;
+    buf1 = (lv_color_t*)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    buf2 = (lv_color_t*)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_DMA);
+  }
+  if (!buf1 || !buf2) {
+    if (buf1) free(buf1);
+    if (buf2) free(buf2);
+    bufPixels = 480 * 16;
+    buf1 = (lv_color_t*)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    buf2 = (lv_color_t*)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_DMA);
+  }
+  if (!buf1 || !buf2) {
+    Serial.println("LVGL DMA buffer alloc failed!");
+    while (true) delay(1000);
+  }
+  Serial.printf("LVGL DMA buffer: %u lines/buf\n", (unsigned)(bufPixels / 480));
+  lv_disp_draw_buf_init(&draw_buf, buf1, buf2, bufPixels);
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res  = 480;
+  disp_drv.ver_res  = 320;
+  disp_drv.flush_cb = my_disp_flush;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_t* disp = lv_disp_drv_register(&disp_drv);
+  if (disp && disp->refr_timer) {
+    lv_timer_set_period(disp->refr_timer, 20);
+  }
+  static lv_indev_drv_t indev_drv;
+  lv_indev_drv_init(&indev_drv);
+  indev_drv.type         = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb      = my_touchpad_read;
+  indev_drv.scroll_limit = 16; // Chống hủy bấm khi tay hơi rung nhẹ
+  lv_indev_t* indev = lv_indev_drv_register(&indev_drv);
+  if (indev && indev->driver && indev->driver->read_timer) {
+    lv_timer_set_period(indev->driver->read_timer, 10);
+  }
+  buildUI();
+  bootStartMs = millis();
+  dataMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(networkTask, "net_task", 8192, NULL, 1, NULL, 0);
+}
+void loop() {
+#if !LV_TICK_CUSTOM
+  static uint32_t lastTick = 0;
+  uint32_t now = millis();
+  lv_tick_inc(now - lastTick);
+  lastTick = now;
+#endif
+  updateSplash();
+  updateClock();
+  updateUI();
+  lv_timer_handler();
+  delay(1);
+}
